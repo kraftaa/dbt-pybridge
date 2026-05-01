@@ -9,7 +9,7 @@ import json
 import math
 import re
 import uuid
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from dbt_pybridge.session import TargetRelation, quote_ident
 
@@ -509,7 +509,7 @@ def _resolve_column_sql_types(
         unknown = sorted(set(column_types) - known_columns)
         if unknown:
             raise RuntimeError(
-                "localpy_column_types has keys that are not in dataframe columns. "
+                "pybridge_column_types (legacy localpy_column_types) has keys that are not in dataframe columns. "
                 f"Unknown keys: {unknown}; dataframe columns: {sorted(known_columns)}"
             )
         column_type_overrides = {
@@ -522,14 +522,14 @@ def _resolve_column_sql_types(
         unknown = sorted(set(categorical_types) - known_columns)
         if unknown:
             raise RuntimeError(
-                "localpy_categorical_types has keys that are not in dataframe columns. "
+                "pybridge_categorical_types (legacy localpy_categorical_types) has keys that are not in dataframe columns. "
                 f"Unknown keys: {unknown}; dataframe columns: {sorted(known_columns)}"
             )
         for col, pg_type in categorical_types.items():
             series = df[str(col)]
             if not isinstance(series.dtype, pd.CategoricalDtype):
                 raise RuntimeError(
-                    "localpy_categorical_types can only be used for categorical columns. "
+                    "pybridge_categorical_types (legacy localpy_categorical_types) can only be used for categorical columns. "
                     f"Column '{col}' has dtype {series.dtype!s}."
                 )
             categorical_type_overrides[col] = _validate_postgres_type_sql(col, pg_type)
@@ -599,7 +599,7 @@ def _copy_dataframe(cur, target: TargetRelation, df, column_sql_types: Optional[
     columns_csv = ", ".join(quote_ident(str(col)) for col in df.columns)
     copy_sql = (
         f"copy {target.render()} ({columns_csv}) "
-        f"from stdin with (format csv, null '{null_marker}')"
+        f"from stdin with (format csv, null '{null_marker}', force_null ({columns_csv}))"
     )
     cur.copy_expert(copy_sql, payload)
     return len(df)
@@ -847,6 +847,7 @@ def write_model_result(
     unique_key: Optional[Sequence[str]] = None,
     column_types: Optional[Dict[str, str]] = None,
     categorical_types: Optional[Dict[str, str]] = None,
+    logger: Optional[Callable[[str], None]] = None,
 ) -> int:
     if result is None:
         raise RuntimeError("Python model returned None; expected dataframe or iterable of dataframes")
@@ -859,6 +860,8 @@ def write_model_result(
 
     if is_pandas_df(result) or is_polars_df(result):
         df = to_pandas(result)
+        if logger is not None:
+            logger(f"Writing {len(df):,} rows to {target.render()} ({materialized})")
         with conn.cursor() as cur:
             if materialized == "table":
                 resolved_types = _resolve_column_sql_types(
@@ -893,13 +896,15 @@ def write_model_result(
         expected_columns = None
         expected_types = None
         with conn.cursor() as cur:
-            for chunk in result:
+            for batch_idx, chunk in enumerate(result, start=1):
                 if not (is_pandas_df(chunk) or is_polars_df(chunk)):
                     raise TypeError(
                         "Chunked Python model must yield pandas or polars dataframes; "
                         f"got {type(chunk)!r}"
                     )
                 chunk_df = to_pandas(chunk)
+                if logger is not None:
+                    logger(f"Writing batch {batch_idx}, rows={len(chunk_df)}")
                 if expected_columns is None:
                     expected_columns = [str(col) for col in chunk_df.columns]
                     if materialized == "table":

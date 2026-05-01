@@ -1,6 +1,6 @@
 # dbt-pybridge
 
-`dbt-pybridge` is a dbt adapter that enables Python models in a normal `dbt run` against Postgres.
+`dbt-pybridge` runs dbt Python models on Postgres by executing Python locally or in CI, then writing results back to Postgres.
 
 It works by:
 - compiling `.py` models through dbt
@@ -54,6 +54,14 @@ def model(dbt, session):
     return df
 ```
 
+Safer projection pattern:
+
+```python
+def model(dbt, session):
+    df = dbt.ref("stg_orders").select("order_id, amount, customer_id")
+    return df
+```
+
 ## How to create Python models
 
 1. Create `models/<name>_python.py`.
@@ -87,22 +95,30 @@ def model(dbt, session):
         yield transform(batch)
 ```
 
+Runtime logging includes progress messages such as:
+
+- `[pybridge] Loading "transform"."stg_orders" (2,300,000 rows, 120.0 MB)`
+- `[pybridge] Processing batch 1, rows=100000`
+- `[pybridge] Writing batch 1, rows=100000`
+
 ## Runtime configs
 
 Set model-level configs via `dbt.config(...)` in your python model:
 
-- `localpy_dataframe_backend`: `pandas` (default) or `polars`
-- `localpy_max_rows`: hard limit before failure (default `1_000_000`)
-- `localpy_warn_rows`: warning threshold (default `200_000`)
-- `localpy_max_bytes`: hard estimated table-size limit before failure (default `536870912`, 512MB)
-- `localpy_warn_bytes`: warning estimated table-size threshold (default `134217728`, 128MB)
-- `localpy_allow_large_tables`: bypass hard row limit (default `false`)
-- `localpy_chunked_mode`: allow oversized input only when using `iter_batches` (default `false`)
-- `localpy_batch_size`: default batch size for `iter_batches` (default `100_000`)
-- `localpy_column_types`: optional explicit type map for created target tables, for example:
+- `pybridge_dataframe_backend`: `pandas` (default) or `polars`
+- `pybridge_max_rows`: hard limit before failure (default `1_000_000`)
+- `pybridge_warn_rows`: warning threshold (default `200_000`)
+- `pybridge_max_bytes`: hard estimated table-size limit before failure (default `536870912`, 512MB)
+- `pybridge_warn_bytes`: warning estimated table-size threshold (default `134217728`, 128MB)
+- `pybridge_allow_large_tables`: bypass hard row limit (default `false`)
+- `pybridge_chunked_mode`: allow oversized input only when using `iter_batches` (default `false`)
+- `pybridge_batch_size`: default batch size for `iter_batches` (default `100_000`)
+- `pybridge_column_types`: optional explicit type map for created target tables, for example:
   - `{"id": "numeric(18,0)", "created_at": "timestamp", "payload": "jsonb"}`
-- `localpy_categorical_types`: optional categorical-column enum type map, for example:
+- `pybridge_categorical_types`: optional categorical-column enum type map, for example:
   - `{"status": "status_enum", "tier": "tier_enum"}`
+
+Legacy `localpy_*` keys are still accepted for backward compatibility.
 
 ## Type inference details
 
@@ -123,7 +139,7 @@ Notes:
 
 - `Decimal` object columns infer `numeric(precision,scale)` from sampled values.
 - Empty or ambiguous object columns fall back to `text` (or `jsonb` for ambiguous list structures).
-- You can always override with `localpy_column_types`.
+- You can always override with `pybridge_column_types`.
 
 ## Honest limitations
 
@@ -132,6 +148,8 @@ Notes:
 - Python runs on local machine / CI runner
 - Not intended for huge tables
 - Best for small/medium transforms
+- Not a replacement for warehouse-scale computation
+- For large tables, use filtering, incremental models, or chunked execution
 
 ## First milestone command
 
@@ -145,10 +163,10 @@ The `examples/mvp_project/` directory has runnable models for each major
 feature:
 
 - `customer_features.py` — minimal pandas table model
-- `orders_polars.py` — polars backend (`localpy_dataframe_backend='polars'`)
+- `orders_polars.py` — polars backend (`pybridge_dataframe_backend='polars'`)
 - `daily_revenue_incremental.py` — incremental + `merge` strategy with
   `unique_key`
-- `orders_with_jsonb.py` — `localpy_column_types` overrides for `jsonb`,
+- `orders_with_jsonb.py` — `pybridge_column_types` overrides for `jsonb`,
   `text[]`, and `numeric(18,4)`
 
 ```bash

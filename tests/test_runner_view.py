@@ -22,7 +22,7 @@ def test_runner_view_materialization_uses_backing_table(monkeypatch):
         pass
 
     class FakeSession:
-        def __init__(self, credentials, limits, dataframe_backend):
+        def __init__(self, credentials, limits, dataframe_backend, logger=None):
             self.conn = FakeConn()
 
         def close(self):
@@ -41,6 +41,7 @@ def test_runner_view_materialization_uses_backing_table(monkeypatch):
         unique_key,
         column_types,
         categorical_types,
+        logger,
     ):
         call_order.append("write")
         calls["write"] = {

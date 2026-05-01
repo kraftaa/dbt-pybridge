@@ -27,6 +27,23 @@ def test_column_types_config_normalization():
     assert out == {"id": "bigint", "2": "text"}
 
 
+def test_column_types_config_normalization_pybridge_key():
+    runner = LocalPythonModelRunner.__new__(LocalPythonModelRunner)
+    out = runner._column_types({"pybridge_column_types": {"id": "bigint", 2: "text"}})
+    assert out == {"id": "bigint", "2": "text"}
+
+
+def test_column_types_prefers_pybridge_key_when_both_set():
+    runner = LocalPythonModelRunner.__new__(LocalPythonModelRunner)
+    out = runner._column_types(
+        {
+            "pybridge_column_types": {"id": "integer"},
+            "localpy_column_types": {"id": "text"},
+        }
+    )
+    assert out == {"id": "integer"}
+
+
 def test_column_types_config_invalid():
     runner = LocalPythonModelRunner.__new__(LocalPythonModelRunner)
     with pytest.raises(RuntimeError):
@@ -36,6 +53,12 @@ def test_column_types_config_invalid():
 def test_categorical_types_config_normalization():
     runner = LocalPythonModelRunner.__new__(LocalPythonModelRunner)
     out = runner._categorical_types({"localpy_categorical_types": {"status": "status_enum", 2: "x_enum"}})
+    assert out == {"status": "status_enum", "2": "x_enum"}
+
+
+def test_categorical_types_config_normalization_pybridge_key():
+    runner = LocalPythonModelRunner.__new__(LocalPythonModelRunner)
+    out = runner._categorical_types({"pybridge_categorical_types": {"status": "status_enum", 2: "x_enum"}})
     assert out == {"status": "status_enum", "2": "x_enum"}
 
 
@@ -57,10 +80,22 @@ def test_limits_parses_boolean_strings():
     assert limits.chunked_mode is True
 
 
+def test_limits_parses_boolean_strings_pybridge_keys():
+    runner = LocalPythonModelRunner.__new__(LocalPythonModelRunner)
+    limits = runner._limits(
+        {
+            "pybridge_allow_large_tables": "false",
+            "pybridge_chunked_mode": "true",
+        }
+    )
+    assert limits.allow_large_tables is False
+    assert limits.chunked_mode is True
+
+
 def test_limits_rejects_invalid_boolean_strings():
     runner = LocalPythonModelRunner.__new__(LocalPythonModelRunner)
     with pytest.raises(RuntimeError):
-        runner._limits({"localpy_allow_large_tables": "maybe"})
+        runner._limits({"pybridge_allow_large_tables": "maybe"})
 
 
 def test_align_validate_columns_reorders():

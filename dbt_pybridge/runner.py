@@ -24,6 +24,15 @@ class RelationFrame:
     def iter_batches(self, batch_size: Optional[int] = None):
         return self._session.iter_relation_batches(self._relation_sql, batch_size=batch_size)
 
+    def select(self, projection_sql: str):
+        projection = str(projection_sql or "").strip()
+        if not projection:
+            raise RuntimeError("dbt.ref(...).select(...) requires a non-empty SQL projection string")
+        if ";" in projection:
+            raise RuntimeError("dbt.ref(...).select(...) does not allow semicolons")
+        relation_sql = f"(select {projection} from {self._relation_sql}) as pybridge_select"
+        return RelationFrame(self._session, relation_sql)
+
     def __getattr__(self, item):
         return getattr(self._load(), item)
 
@@ -60,9 +69,22 @@ class LocalPythonModelRunner:
         # dbt model config object behaves like mapping.
         return dict(raw_config)
 
+    @staticmethod
+    def _cfg_value(cfg: Dict[str, Any], key: str, legacy_key: Optional[str] = None, default: Any = None) -> Any:
+        if key in cfg:
+            return cfg.get(key)
+        if legacy_key and legacy_key in cfg:
+            return cfg.get(legacy_key)
+        return default
+
+    @staticmethod
+    def _log(message: str) -> None:
+        print(f"[pybridge] {message}")
+
     def _limits(self, cfg: Dict[str, Any]) -> ModelLimits:
         def _as_int(key: str, default: int) -> int:
-            value = cfg.get(key, default)
+            legacy_key = key.replace("pybridge_", "localpy_") if key.startswith("pybridge_") else None
+            value = self._cfg_value(cfg, key, legacy_key, default)
             try:
                 parsed = int(value)
             except (TypeError, ValueError):
@@ -72,7 +94,8 @@ class LocalPythonModelRunner:
             return parsed
 
         def _as_bool(key: str, default: bool) -> bool:
-            value = cfg.get(key, default)
+            legacy_key = key.replace("pybridge_", "localpy_") if key.startswith("pybridge_") else None
+            value = self._cfg_value(cfg, key, legacy_key, default)
             if isinstance(value, bool):
                 return value
             if isinstance(value, int) and value in (0, 1):
@@ -88,23 +111,23 @@ class LocalPythonModelRunner:
             )
 
         return ModelLimits(
-            max_rows=_as_int("localpy_max_rows", 1_000_000),
-            warn_rows=_as_int("localpy_warn_rows", 200_000),
-            max_bytes=_as_int("localpy_max_bytes", 512 * 1024 * 1024),
-            warn_bytes=_as_int("localpy_warn_bytes", 128 * 1024 * 1024),
-            batch_size=_as_int("localpy_batch_size", 100_000),
-            allow_large_tables=_as_bool("localpy_allow_large_tables", False),
-            chunked_mode=_as_bool("localpy_chunked_mode", False),
+            max_rows=_as_int("pybridge_max_rows", 1_000_000),
+            warn_rows=_as_int("pybridge_warn_rows", 200_000),
+            max_bytes=_as_int("pybridge_max_bytes", 512 * 1024 * 1024),
+            warn_bytes=_as_int("pybridge_warn_bytes", 128 * 1024 * 1024),
+            batch_size=_as_int("pybridge_batch_size", 100_000),
+            allow_large_tables=_as_bool("pybridge_allow_large_tables", False),
+            chunked_mode=_as_bool("pybridge_chunked_mode", False),
         )
 
     def _column_types(self, cfg: Dict[str, Any]) -> Optional[Dict[str, str]]:
-        return self._type_mapping_config(cfg, "localpy_column_types")
+        return self._type_mapping_config(cfg, "pybridge_column_types", legacy_key="localpy_column_types")
 
     def _categorical_types(self, cfg: Dict[str, Any]) -> Optional[Dict[str, str]]:
-        return self._type_mapping_config(cfg, "localpy_categorical_types")
+        return self._type_mapping_config(cfg, "pybridge_categorical_types", legacy_key="localpy_categorical_types")
 
-    def _type_mapping_config(self, cfg: Dict[str, Any], key: str) -> Optional[Dict[str, str]]:
-        raw = cfg.get(key)
+    def _type_mapping_config(self, cfg: Dict[str, Any], key: str, legacy_key: Optional[str] = None) -> Optional[Dict[str, str]]:
+        raw = self._cfg_value(cfg, key, legacy_key, None)
         if raw is None:
             return None
         if not isinstance(raw, Mapping):
@@ -217,7 +240,9 @@ class LocalPythonModelRunner:
 
     def run(self) -> int:
         cfg = self._model_config()
-        dataframe_backend = str(cfg.get("localpy_dataframe_backend", "pandas")).lower()
+        dataframe_backend = str(
+            self._cfg_value(cfg, "pybridge_dataframe_backend", "localpy_dataframe_backend", "pandas")
+        ).lower()
         limits = self._limits(cfg)
         materialized = str(cfg.get("materialized", "table")).lower()
         unique_key = self._normalize_unique_key(cfg.get("unique_key"))
@@ -231,6 +256,7 @@ class LocalPythonModelRunner:
             credentials=self.credentials,
             limits=limits,
             dataframe_backend=dataframe_backend,
+            logger=self._log,
         )
 
         try:
@@ -272,6 +298,7 @@ class LocalPythonModelRunner:
                     unique_key=None,
                     column_types=column_types,
                     categorical_types=categorical_types,
+                    logger=self._log,
                 )
                 self._create_or_replace_view(session.conn, target, backing_target)
                 return rows_written
@@ -286,6 +313,7 @@ class LocalPythonModelRunner:
                 unique_key=unique_key,
                 column_types=column_types,
                 categorical_types=categorical_types,
+                logger=self._log,
             )
         finally:
             session.close()

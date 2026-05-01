@@ -165,6 +165,7 @@ def test_copy_dataframe_nullable_int64_writes_null_marker():
     assert parsed_rows[0][0] == "1"
     assert parsed_rows[1][0] == marker
     assert parsed_rows[2][0] == "3"
+    assert "force_null" in cur.copy_sql.lower()
 
 
 def test_copy_dataframe_object_column_with_none_writes_null_marker():

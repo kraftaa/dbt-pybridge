@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterator, Optional
+from typing import Callable, Iterator, Optional
 import uuid
 import warnings
 
@@ -40,10 +40,17 @@ def quote_ident(value: str) -> str:
 
 
 class LocalPostgresSession:
-    def __init__(self, credentials, limits: ModelLimits, dataframe_backend: str = "pandas") -> None:
+    def __init__(
+        self,
+        credentials,
+        limits: ModelLimits,
+        dataframe_backend: str = "pandas",
+        logger: Optional[Callable[[str], None]] = None,
+    ) -> None:
         self.credentials = credentials
         self.limits = limits
         self.dataframe_backend = dataframe_backend
+        self._logger = logger
         self.conn = psycopg2.connect(
             dbname=credentials.database,
             user=credentials.user,
@@ -56,6 +63,10 @@ class LocalPostgresSession:
 
     def close(self) -> None:
         self.conn.close()
+
+    def _log(self, message: str) -> None:
+        if self._logger is not None:
+            self._logger(message)
 
     @staticmethod
     def _human_bytes(value: int) -> str:
@@ -201,6 +212,10 @@ class LocalPostgresSession:
         relation_sql = self._normalize_relation_sql(relation_sql)
         row_count = self.count_rows(relation_sql)
         byte_count = self.count_bytes(relation_sql)
+        if byte_count is None:
+            self._log(f"Loading {relation_sql} ({row_count:,} rows)")
+        else:
+            self._log(f"Loading {relation_sql} ({row_count:,} rows, {self._human_bytes(byte_count)})")
         if row_count > self.limits.warn_rows:
             warnings.warn(
                 (
@@ -223,7 +238,8 @@ class LocalPostgresSession:
             raise RuntimeError(
                 (
                     f"Relation {relation_sql} has {row_count:,} rows, above limit {self.limits.max_rows:,}. "
-                    "Set localpy_allow_large_tables=true or localpy_chunked_mode=true to opt in."
+                    "Set pybridge_allow_large_tables=true or pybridge_chunked_mode=true to opt in. "
+                    "(Legacy localpy_* keys are still accepted.)"
                 )
             )
         if byte_count is not None and byte_count > self.limits.max_bytes and not can_bypass_limit:
@@ -231,7 +247,8 @@ class LocalPostgresSession:
                 (
                     f"Relation {relation_sql} estimated size is {self._human_bytes(byte_count)}, "
                     f"above limit {self._human_bytes(self.limits.max_bytes)}. "
-                    "Set localpy_allow_large_tables=true or localpy_chunked_mode=true to opt in."
+                    "Set pybridge_allow_large_tables=true or pybridge_chunked_mode=true to opt in. "
+                    "(Legacy localpy_* keys are still accepted.)"
                 )
             )
         return row_count
@@ -257,7 +274,8 @@ class LocalPostgresSession:
         if chunk_size <= 0:
             raise RuntimeError(f"Batch size must be > 0, got {chunk_size}")
 
-        for chunk in self._iter_query_to_pandas(query, chunk_size):
+        for batch_idx, chunk in enumerate(self._iter_query_to_pandas(query, chunk_size), start=1):
+            self._log(f"Processing batch {batch_idx}, rows={len(chunk)}")
             if self.dataframe_backend == "polars":
                 yield pl.from_pandas(chunk)
             else:
