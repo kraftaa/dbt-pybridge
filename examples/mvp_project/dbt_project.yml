@@ -1,0 +1,11 @@
+name: mvp_project
+version: 1.0
+config-version: 2
+
+profile: mvp_project
+
+model-paths: ["models"]
+
+models:
+  mvp_project:
+    +materialized: table

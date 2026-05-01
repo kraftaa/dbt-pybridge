@@ -52,6 +52,31 @@ def model(dbt, session):
     return df
 ```
 
+## How to create Python models
+
+1. Create `models/<name>_python.py`.
+2. Define exactly one callable entrypoint: `def model(dbt, session): ...`.
+3. Set materialization inside the function:
+   - `dbt.config(materialized="table")`
+4. Read upstream inputs using standalone ref/source assignments (important for dbt parser):
+   - `orders = dbt.ref("stg_orders")`
+   - `raw_orders = dbt.source("raw", "orders")`
+5. Return one of:
+   - pandas DataFrame
+   - polars DataFrame
+   - iterable/generator that yields pandas/polars DataFrames
+
+Parser-safe pattern:
+
+```python
+def model(dbt, session):
+    dbt.config(materialized="table")
+    orders = dbt.ref("stg_orders")
+    result = orders.copy()
+    result["double_amount"] = result["amount"] * 2
+    return result
+```
+
 Chunked mode:
 
 ```python

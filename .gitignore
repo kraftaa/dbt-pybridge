@@ -1,0 +1,29 @@
+# OS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.Python
+
+# Virtual environments
+.venv/
+.venv312/
+venv/
+
+# Test/cache tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# dbt artifacts
+logs/
+target/
+dbt_packages/
+dbt_modules/
+**/logs/
+**/target/
+
