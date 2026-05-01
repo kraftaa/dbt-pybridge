@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
 from dbt_pybridge.dataframe_io import write_model_result
-from dbt_pybridge.session import LocalPostgresSession, ModelLimits, TargetRelation
+from dbt_pybridge.session import LocalPostgresSession, ModelLimits, TargetRelation, quote_ident
 
 
 class RelationFrame:
@@ -83,6 +83,71 @@ class LocalPythonModelRunner:
             f"Expected string or list of strings, got {type(unique_key)!r}"
         )
 
+    def _view_backing_relation(self, view_target: TargetRelation) -> TargetRelation:
+        prefix = "__dbt_pybridge_view_"
+        raw = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in view_target.identifier.lower())
+        suffix = raw or "model"
+        max_suffix_len = max(1, 63 - len(prefix))
+        identifier = f"{prefix}{suffix[:max_suffix_len]}"
+        return TargetRelation(
+            database=view_target.database,
+            schema=view_target.schema,
+            identifier=identifier,
+        )
+
+    def _relation_kind(self, conn, relation: TargetRelation) -> Optional[str]:
+        with conn.cursor() as cur:
+            if relation.schema:
+                cur.execute(
+                    """
+                    select c.relkind
+                    from pg_catalog.pg_class c
+                    join pg_catalog.pg_namespace n on n.oid = c.relnamespace
+                    where n.nspname = %s and c.relname = %s
+                    limit 1
+                    """,
+                    (relation.schema, relation.identifier),
+                )
+            else:
+                cur.execute(
+                    """
+                    select c.relkind
+                    from pg_catalog.pg_class c
+                    where c.relname = %s and pg_table_is_visible(c.oid)
+                    limit 1
+                    """,
+                    (relation.identifier,),
+                )
+            row = cur.fetchone()
+            return row[0] if row else None
+
+    def _drop_relation_for_view_conflict(self, conn, relation: TargetRelation) -> None:
+        relkind = self._relation_kind(conn, relation)
+        if relkind is None or relkind == "v":
+            return
+
+        relation_sql = relation.render()
+        drop_sql = {
+            "r": f"drop table if exists {relation_sql}",
+            "p": f"drop table if exists {relation_sql}",
+            "m": f"drop materialized view if exists {relation_sql}",
+            "f": f"drop foreign table if exists {relation_sql}",
+        }.get(relkind, f"drop table if exists {relation_sql}")
+
+        with conn.cursor() as cur:
+            cur.execute(drop_sql)
+        conn.commit()
+
+    def _create_or_replace_view(self, conn, view_target: TargetRelation, backing_table: TargetRelation) -> None:
+        self._drop_relation_for_view_conflict(conn, view_target)
+        view_sql = view_target.render()
+        backing_sql = backing_table.render()
+        with conn.cursor() as cur:
+            if view_target.schema:
+                cur.execute(f"create schema if not exists {quote_ident(view_target.schema)}")
+            cur.execute(f"create or replace view {view_sql} as select * from {backing_sql}")
+        conn.commit()
+
     def run(self) -> int:
         cfg = self._model_config()
         dataframe_backend = str(cfg.get("localpy_dataframe_backend", "pandas")).lower()
@@ -121,6 +186,20 @@ class LocalPythonModelRunner:
             if isinstance(model_result, RelationFrame):
                 model_result = model_result.as_dataframe()
             target = self._target_relation()
+            if materialized == "view":
+                backing_target = self._view_backing_relation(target)
+                rows_written = write_model_result(
+                    conn=session.conn,
+                    target=backing_target,
+                    result=model_result,
+                    batch_size=limits.batch_size,
+                    materialized="table",
+                    incremental_strategy="append",
+                    unique_key=None,
+                )
+                self._create_or_replace_view(session.conn, target, backing_target)
+                return rows_written
+
             return write_model_result(
                 conn=session.conn,
                 target=target,
