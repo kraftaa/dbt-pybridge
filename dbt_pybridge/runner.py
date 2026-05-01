@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from dbt_pybridge.dataframe_io import write_model_result
 from dbt_pybridge.session import LocalPostgresSession, ModelLimits, TargetRelation
@@ -68,10 +68,30 @@ class LocalPythonModelRunner:
             identifier=self.parsed_model.get("alias") or self.parsed_model.get("name"),
         )
 
+    def _normalize_unique_key(self, unique_key: Any) -> Optional[List[str]]:
+        if unique_key is None:
+            return None
+        if isinstance(unique_key, str):
+            return [unique_key]
+        if isinstance(unique_key, (list, tuple)):
+            keys = [str(v) for v in unique_key]
+            if not keys:
+                return None
+            return keys
+        raise RuntimeError(
+            "Invalid unique_key for incremental Python model. "
+            f"Expected string or list of strings, got {type(unique_key)!r}"
+        )
+
     def run(self) -> int:
         cfg = self._model_config()
         dataframe_backend = str(cfg.get("localpy_dataframe_backend", "pandas")).lower()
         limits = self._limits(cfg)
+        materialized = str(cfg.get("materialized", "table")).lower()
+        unique_key = self._normalize_unique_key(cfg.get("unique_key"))
+        incremental_strategy = str(cfg.get("incremental_strategy", "default")).lower()
+        if incremental_strategy == "default":
+            incremental_strategy = "merge" if unique_key else "append"
 
         session = LocalPostgresSession(
             credentials=self.credentials,
@@ -106,6 +126,9 @@ class LocalPythonModelRunner:
                 target=target,
                 result=model_result,
                 batch_size=limits.batch_size,
+                materialized=materialized,
+                incremental_strategy=incremental_strategy,
+                unique_key=unique_key,
             )
         finally:
             session.close()

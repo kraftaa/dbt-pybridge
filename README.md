@@ -10,11 +10,13 @@ It works by:
 
 ## Status
 
-MVP scope (table materialization only) is implemented.
+MVP scope for Python table + incremental materializations is implemented.
 
 - Supported: `materialized='table'`
+- Supported: `materialized='incremental'` (strategies: `append`, `merge`, `delete+insert`)
 - Supported DAG: `sql -> python -> sql`
 - Supported return types: pandas DataFrame, polars DataFrame, or iterable/generator of dataframes
+- Not yet supported for Python: `materialized='view'`
 
 ## Install
 
