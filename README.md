@@ -94,9 +94,36 @@ Set model-level configs via `dbt.config(...)` in your python model:
 - `localpy_dataframe_backend`: `pandas` (default) or `polars`
 - `localpy_max_rows`: hard limit before failure (default `1_000_000`)
 - `localpy_warn_rows`: warning threshold (default `200_000`)
+- `localpy_max_bytes`: hard estimated table-size limit before failure (default `536870912`, 512MB)
+- `localpy_warn_bytes`: warning estimated table-size threshold (default `134217728`, 128MB)
 - `localpy_allow_large_tables`: bypass hard row limit (default `false`)
 - `localpy_chunked_mode`: allow oversized input only when using `iter_batches` (default `false`)
 - `localpy_batch_size`: default batch size for `iter_batches` (default `100_000`)
+- `localpy_column_types`: optional explicit type map for created target tables, for example:
+  - `{"id": "numeric(18,0)", "created_at": "timestamp", "payload": "jsonb"}`
+- `localpy_categorical_types`: optional categorical-column enum type map, for example:
+  - `{"status": "status_enum", "tier": "tier_enum"}`
+
+## Type inference details
+
+Default inferred target types now include:
+
+- Numeric widths:
+  - `smallint` / `integer` / `bigint` / `numeric` (for wide unsigned integers)
+  - `real` / `double precision`
+- Temporal:
+  - `date`, `time`, `timetz`, `timestamp`, `timestamptz`, `interval`
+- Structured / special:
+  - `uuid`, `bytea`, `jsonb`
+- Arrays (homogeneous scalar list/tuple object columns):
+  - `boolean[]`, `bigint[]`, `double precision[]`, `text[]`, `uuid[]`, `date[]`, `time[]`, `timetz[]`, `timestamp[]`, `timestamptz[]`, `numeric[]`
+  - mixed or nested list structures fall back to `jsonb`
+
+Notes:
+
+- `Decimal` object columns infer `numeric(precision,scale)` from sampled values.
+- Empty or ambiguous object columns fall back to `text` (or `jsonb` for ambiguous list structures).
+- You can always override with `localpy_column_types`.
 
 ## Honest limitations
 
@@ -110,4 +137,25 @@ Set model-level configs via `dbt.config(...)` in your python model:
 
 ```bash
 dbt run -s customer_features
+```
+
+## More examples
+
+The `examples/mvp_project/` directory has runnable models for each major
+feature:
+
+- `customer_features.py` — minimal pandas table model
+- `orders_polars.py` — polars backend (`localpy_dataframe_backend='polars'`)
+- `daily_revenue_incremental.py` — incremental + `merge` strategy with
+  `unique_key`
+- `orders_with_jsonb.py` — `localpy_column_types` overrides for `jsonb`,
+  `text[]`, and `numeric(18,4)`
+
+```bash
+cd examples/mvp_project
+dbt run -s orders_polars
+dbt run -s daily_revenue_incremental
+dbt run -s daily_revenue_incremental                # second run exercises merge
+dbt run -s daily_revenue_incremental --full-refresh # rebuild from scratch
+dbt run -s orders_with_jsonb
 ```

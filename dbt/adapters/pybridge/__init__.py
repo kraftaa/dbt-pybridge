@@ -1,5 +1,6 @@
 from dbt.adapters.base import AdapterPlugin
 
+from dbt.adapters.pybridge.__version__ import version as __version__
 from dbt.adapters.pybridge.connections import PybridgeCredentials
 from dbt.adapters.pybridge.impl import PybridgeAdapter
 from dbt_pybridge import PACKAGE_PATH
