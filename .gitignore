@@ -27,3 +27,22 @@ dbt_modules/
 **/logs/
 **/target/
 
+# Local/real project content (keep this repo example-only)
+profiles.yml
+**/profiles.yml
+.env
+.env.*
+
+# Ignore ad-hoc dbt project resources added at repo root
+models/**
+seeds/**
+snapshots/**
+analyses/**
+macros/**
+
+# Keep curated example project tracked
+!examples/
+!examples/mvp_project/
+!examples/mvp_project/**
+examples/mvp_project/logs/
+examples/mvp_project/target/
