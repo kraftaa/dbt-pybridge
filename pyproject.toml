@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dbt-pybridge"
-version = "0.1.1"
+version = "0.1.2"
 description = "Run dbt Python models locally and materialize results back to Postgres"
 readme = "README.md"
 requires-python = ">=3.11"
