@@ -72,26 +72,8 @@ def model(dbt, session):
     return df
 ```
 
-## When to use Python vs SQL
-
-Use SQL when:
-- the transform is mostly joins/aggregations/filters on large tables
-- the warehouse can do the work directly and efficiently
-
-Use Python when:
-- logic is awkward in SQL but straightforward in Python
-- you need libraries or code patterns that are hard to express in SQL
-- you can keep input size bounded (filtering, incremental, or chunked mode)
-
-Good Python candidates:
-- JSON/array normalization and complex object cleanup
-- text processing, regex-heavy logic, scoring, custom feature engineering
-- row-wise business rules that become unreadable in SQL
-
-Keep the boundary clean:
-- push down filtering/projection first (`.select(...)` + upstream SQL)
-- process remaining rows in Python
-- write back as table/incremental/view for downstream SQL models
+For SQL vs Python decision guidance and larger-model patterns, see:
+- [docs/scaling_python_models.md](docs/scaling_python_models.md)
 
 ## How to create Python models
 
@@ -124,25 +106,6 @@ Chunked mode:
 def model(dbt, session):
     for batch in dbt.ref("stg_orders").iter_batches(batch_size=100_000):
         yield transform(batch)
-```
-
-Chunked incremental pattern:
-
-```python
-def model(dbt, session):
-    dbt.config(
-        materialized="incremental",
-        incremental_strategy="append",
-        pybridge_chunked_mode=True,
-        pybridge_batch_size=100_000,
-    )
-
-    for batch in dbt.ref("stg_orders").select("order_id, amount").iter_batches():
-        out = batch.copy()
-        out["amount_bucket"] = out["amount"].apply(
-            lambda value: "high" if value >= 100 else "standard"
-        )
-        yield out
 ```
 
 Runtime logging includes progress messages such as:
@@ -200,6 +163,7 @@ Notes:
 - Best for small/medium transforms
 - Not a replacement for warehouse-scale computation
 - For large tables, use filtering, incremental models, or chunked execution
+- For detailed patterns, see [docs/scaling_python_models.md](docs/scaling_python_models.md)
 
 ## First milestone command
 
