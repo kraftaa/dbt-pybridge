@@ -65,8 +65,11 @@ class LocalPostgresSession:
         self.conn.close()
 
     def _log(self, message: str) -> None:
-        if self._logger is not None:
-            self._logger(message)
+        # getattr fallback: tests construct sessions via __new__, bypassing
+        # __init__ where _logger is set. Don't fail noisily on those.
+        logger = getattr(self, "_logger", None)
+        if logger is not None:
+            logger(message)
 
     @staticmethod
     def _human_bytes(value: int) -> str:
@@ -254,19 +257,16 @@ class LocalPostgresSession:
         return row_count
 
     def load_relation(self, relation_sql: str):
-        import polars as pl
-
         relation_sql = self._normalize_relation_sql(relation_sql)
         self.enforce_size_limits(relation_sql, for_chunking=False)
         query = f"select * from {relation_sql}"
         df = self._query_to_pandas(query)
         if self.dataframe_backend == "polars":
+            import polars as pl
             return pl.from_pandas(df)
         return df
 
     def iter_relation_batches(self, relation_sql: str, batch_size: Optional[int] = None) -> Iterator:
-        import polars as pl
-
         relation_sql = self._normalize_relation_sql(relation_sql)
         self.enforce_size_limits(relation_sql, for_chunking=True)
         query = f"select * from {relation_sql}"
@@ -277,6 +277,7 @@ class LocalPostgresSession:
         for batch_idx, chunk in enumerate(self._iter_query_to_pandas(query, chunk_size), start=1):
             self._log(f"Processing batch {batch_idx}, rows={len(chunk)}")
             if self.dataframe_backend == "polars":
+                import polars as pl
                 yield pl.from_pandas(chunk)
             else:
                 yield chunk
