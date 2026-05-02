@@ -1,12 +1,16 @@
 # dbt-pybridge
 
-`dbt-pybridge` runs dbt Python models on Postgres by executing Python locally or in CI, then writing results back to Postgres.
+Run dbt Python models on Postgres.
+
+`dbt-pybridge` executes Python locally or in CI, reads inputs from Postgres via `dbt.ref()` / `dbt.source()`, then writes results back to Postgres.
 
 It works by:
 - compiling `.py` models through dbt
 - executing Python locally (developer laptop or CI runner)
 - loading `dbt.ref()` / `dbt.source()` data into pandas/polars
 - writing the returned dataframe back into Postgres
+
+This is useful when you want Python transforms in dbt without a warehouse-native Python runtime (for example Spark/Snowpark).
 
 ## Status
 
@@ -21,10 +25,16 @@ MVP scope for Python table + incremental + view materializations is implemented.
 ## Install
 
 ```bash
-pip install -e .
+pip install dbt-pybridge
 ```
 
-Use a supported Python version (3.11/3.12 recommended).
+Requires Python `>=3.11` (3.11/3.12 recommended).
+
+For local development of this repo only:
+
+```bash
+pip install -e .
+```
 
 ## Profile
 
@@ -62,6 +72,27 @@ def model(dbt, session):
     return df
 ```
 
+## When to use Python vs SQL
+
+Use SQL when:
+- the transform is mostly joins/aggregations/filters on large tables
+- the warehouse can do the work directly and efficiently
+
+Use Python when:
+- logic is awkward in SQL but straightforward in Python
+- you need libraries or code patterns that are hard to express in SQL
+- you can keep input size bounded (filtering, incremental, or chunked mode)
+
+Good Python candidates:
+- JSON/array normalization and complex object cleanup
+- text processing, regex-heavy logic, scoring, custom feature engineering
+- row-wise business rules that become unreadable in SQL
+
+Keep the boundary clean:
+- push down filtering/projection first (`.select(...)` + upstream SQL)
+- process remaining rows in Python
+- write back as table/incremental/view for downstream SQL models
+
 ## How to create Python models
 
 1. Create `models/<name>_python.py`.
@@ -93,6 +124,25 @@ Chunked mode:
 def model(dbt, session):
     for batch in dbt.ref("stg_orders").iter_batches(batch_size=100_000):
         yield transform(batch)
+```
+
+Chunked incremental pattern:
+
+```python
+def model(dbt, session):
+    dbt.config(
+        materialized="incremental",
+        incremental_strategy="append",
+        pybridge_chunked_mode=True,
+        pybridge_batch_size=100_000,
+    )
+
+    for batch in dbt.ref("stg_orders").select("order_id, amount").iter_batches():
+        out = batch.copy()
+        out["amount_bucket"] = out["amount"].apply(
+            lambda value: "high" if value >= 100 else "standard"
+        )
+        yield out
 ```
 
 Runtime logging includes progress messages such as:
@@ -166,6 +216,8 @@ feature:
 - `orders_polars.py` — polars backend (`pybridge_dataframe_backend='polars'`)
 - `daily_revenue_incremental.py` — incremental + `merge` strategy with
   `unique_key`
+- `orders_chunked_incremental.py` — chunked incremental pattern for bounded
+  memory usage
 - `orders_with_jsonb.py` — `pybridge_column_types` overrides for `jsonb`,
   `text[]`, and `numeric(18,4)`
 
@@ -175,5 +227,6 @@ dbt run -s orders_polars
 dbt run -s daily_revenue_incremental
 dbt run -s daily_revenue_incremental                # second run exercises merge
 dbt run -s daily_revenue_incremental --full-refresh # rebuild from scratch
+dbt run -s orders_chunked_incremental
 dbt run -s orders_with_jsonb
 ```

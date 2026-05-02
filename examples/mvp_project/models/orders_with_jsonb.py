@@ -1,5 +1,5 @@
 def model(dbt, session):
-    """Demonstrates jsonb + array Postgres types via `localpy_column_types`.
+    """Demonstrates jsonb + array Postgres types via `pybridge_column_types`.
 
     Without the override, dbt-pybridge would infer types from the dataframe:
         - `tags`        list[str]   -> text[]
@@ -13,7 +13,7 @@ def model(dbt, session):
     """
     dbt.config(
         materialized="table",
-        localpy_column_types={
+        pybridge_column_types={
             "amount":     "numeric(18,4)",
             "tags":       "text[]",
             "attributes": "jsonb",
