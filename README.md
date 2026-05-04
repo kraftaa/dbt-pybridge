@@ -36,6 +36,10 @@ For local development of this repo only:
 pip install -e .
 ```
 
+## Docs
+
+- [Scaling Python models](docs/scaling_python_models.md) — SQL vs Python decision rules, chunking/incremental patterns, and debugging checklist.
+
 ## Profile
 
 Set your profile `type` to `pybridge`:
@@ -71,9 +75,6 @@ def model(dbt, session):
     df = dbt.ref("stg_orders").select("order_id, amount, customer_id")
     return df
 ```
-
-For SQL vs Python decision guidance and larger-model patterns, see:
-- [docs/scaling_python_models.md](docs/scaling_python_models.md)
 
 ## How to create Python models
 
@@ -163,7 +164,6 @@ Notes:
 - Best for small/medium transforms
 - Not a replacement for warehouse-scale computation
 - For large tables, use filtering, incremental models, or chunked execution
-- For detailed patterns, see [docs/scaling_python_models.md](docs/scaling_python_models.md)
 
 ## First milestone command
 
