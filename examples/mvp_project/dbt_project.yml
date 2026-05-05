@@ -5,6 +5,7 @@ config-version: 2
 profile: mvp_project
 
 model-paths: ["models"]
+seed-paths: ["seeds"]
 
 models:
   mvp_project:

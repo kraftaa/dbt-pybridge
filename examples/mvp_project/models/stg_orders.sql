@@ -1,7 +1,6 @@
+{{ config(materialized='table') }}
+
 select
-  1 as order_id,
-  10::numeric as amount
-union all
-select
-  2 as order_id,
-  15::numeric as amount
+  cast(order_id as bigint) as order_id,
+  cast(amount as numeric(12,2)) as amount
+from {{ ref('orders') }}

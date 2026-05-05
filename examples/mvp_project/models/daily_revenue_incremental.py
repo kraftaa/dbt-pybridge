@@ -20,6 +20,8 @@ def model(dbt, session):
 
     orders = dbt.ref("stg_orders").as_dataframe()
     out = orders.copy()
-    out["revenue"] = out["amount"] * 1.0
+    # `amount` arrives from Postgres as decimal.Decimal; coerce to float before
+    # any arithmetic that mixes Python numeric types.
+    out["revenue"] = pd.to_numeric(out["amount"], errors="coerce")
     out["loaded_at"] = pd.Timestamp.utcnow()
     return out

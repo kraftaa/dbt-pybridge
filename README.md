@@ -298,6 +298,7 @@ feature:
 
 ```bash
 cd examples/mvp_project
+dbt seed
 dbt run -s orders_polars
 dbt run -s daily_revenue_incremental
 dbt run -s daily_revenue_incremental                # second run exercises merge
