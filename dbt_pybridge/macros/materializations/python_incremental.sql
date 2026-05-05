@@ -30,6 +30,7 @@
 
     {% if full_refresh_mode and existing_relation is not none %}
       {{ drop_relation_if_exists(existing_relation) }}
+      {% do adapter.commit() %}
       {% set existing_relation = none %}
     {% endif %}
 
