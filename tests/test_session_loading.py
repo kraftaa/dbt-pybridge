@@ -50,7 +50,7 @@ class FakeConn:
 
 
 class FakeCredentials:
-    def __init__(self, database="rx_development"):
+    def __init__(self, database="demo_db"):
         self.database = database
 
 
@@ -109,7 +109,7 @@ def test_iter_relation_batches_without_description_metadata():
 
 def test_normalize_relation_sql_drops_current_database():
     session = _make_session(rows=[], columns=[])
-    relation = '"rx_development"."transform"."stg_big_orders"'
+    relation = '"demo_db"."transform"."stg_big_orders"'
     assert session._normalize_relation_sql(relation) == '"transform"."stg_big_orders"'
 
 

@@ -178,15 +178,15 @@ def test_load_df_function_normalizes_three_part_relation():
     from dbt_pybridge.session import LocalPostgresSession, ModelLimits
 
     session = LocalPostgresSession.__new__(LocalPostgresSession)
-    session.credentials = type("C", (), {"database": "rx_development"})()
+    session.credentials = type("C", (), {"database": "demo_db"})()
     session.limits = ModelLimits()
     session.dataframe_backend = "pandas"
 
     load = LocalPythonModelRunner._load_df_function(session)
-    rf = load('"rx_development"."transform"."orders"')
+    rf = load('"demo_db"."transform"."orders"')
     assert rf._relation_sql == '"transform"."orders"'
 
     # The same load is the only place we need to normalize; downstream
     # .select() must NOT re-introduce the database qualifier.
     selected = rf.select("id, customer_id")
-    assert '"rx_development"' not in selected._relation_sql
+    assert '"demo_db"' not in selected._relation_sql
