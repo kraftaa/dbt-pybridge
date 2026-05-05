@@ -16,6 +16,11 @@ dependencies = [
   "psycopg2-binary>=2.9",
 ]
 
+[project.optional-dependencies]
+examples = [
+  "scikit-learn>=1.4,<2",
+]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["dbt*", "dbt_pybridge*"]

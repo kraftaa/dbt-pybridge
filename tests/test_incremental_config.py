@@ -341,3 +341,206 @@ def test_create_table_rejects_ambiguous_stringified_column_names():
             df,
             replace=True,
         )
+
+
+def test_align_validate_columns_message_lists_missing_and_new():
+    df = pd.DataFrame({"a": [1], "b": [2], "z": [9]})  # has new "z", missing "c"
+    with pytest.raises(RuntimeError) as exc:
+        _align_and_validate_columns(df, ["a", "b", "c"])
+    msg = str(exc.value)
+    assert "missing from model output" in msg
+    assert "['c']" in msg
+    assert "new in model output" in msg
+    assert "['z']" in msg
+    assert "append_new_columns" in msg  # hint for the user
+
+
+def test_apply_schema_change_append_new_columns():
+    class FakeCursor:
+        def __init__(self):
+            self.sql = []
+
+        def execute(self, query, params=None):
+            self.sql.append(query)
+
+    cur = FakeCursor()
+    target = TargetRelation(database=None, schema="transform", identifier="t")
+    df = pd.DataFrame({"id": [1], "name": ["a"], "new_col": [3.14]})
+    cols, types = dataframe_io._apply_schema_change(
+        cur,
+        target,
+        df,
+        target_columns=["id", "name"],
+        target_column_types={"id": "bigint", "name": "text"},
+        on_schema_change="append_new_columns",
+    )
+    assert "new_col" in cols
+    assert types["new_col"] == "double precision"
+    assert any("alter table" in q.lower() and "add column" in q.lower() and "new_col" in q.lower() for q in cur.sql)
+    # Must NOT drop the missing column under append_new_columns
+    assert not any("drop column" in q.lower() for q in cur.sql)
+
+
+def test_apply_schema_change_sync_all_columns_drops_missing():
+    class FakeCursor:
+        def __init__(self):
+            self.sql = []
+
+        def execute(self, query, params=None):
+            self.sql.append(query)
+
+    cur = FakeCursor()
+    target = TargetRelation(database=None, schema="transform", identifier="t")
+    df = pd.DataFrame({"id": [1], "new_col": ["x"]})  # name was dropped, new_col added
+    cols, types = dataframe_io._apply_schema_change(
+        cur,
+        target,
+        df,
+        target_columns=["id", "name"],
+        target_column_types={"id": "bigint", "name": "text"},
+        on_schema_change="sync_all_columns",
+    )
+    assert "new_col" in cols
+    assert "name" not in cols
+    assert any("add column" in q.lower() and "new_col" in q.lower() for q in cur.sql)
+    drop_stmts = [q for q in cur.sql if "drop column" in q.lower() and "name" in q.lower()]
+    assert drop_stmts, "expected a DROP COLUMN statement for the removed column"
+    # Default is RESTRICT (no CASCADE keyword) — Postgres errors clearly if a
+    # dependent exists, instead of silently destroying it.
+    assert all("cascade" not in q.lower() for q in drop_stmts)
+
+
+def test_apply_schema_change_sync_all_columns_cascade_opt_in():
+    class FakeCursor:
+        def __init__(self):
+            self.sql = []
+
+        def execute(self, query, params=None):
+            self.sql.append(query)
+
+    cur = FakeCursor()
+    target = TargetRelation(database=None, schema="transform", identifier="t")
+    df = pd.DataFrame({"id": [1]})  # "name" was dropped
+    dataframe_io._apply_schema_change(
+        cur,
+        target,
+        df,
+        target_columns=["id", "name"],
+        target_column_types={"id": "bigint", "name": "text"},
+        on_schema_change="sync_all_columns",
+        cascade_drops=True,
+    )
+    drop_stmts = [q for q in cur.sql if "drop column" in q.lower()]
+    assert drop_stmts
+    assert all("cascade" in q.lower() for q in drop_stmts)
+
+
+def test_apply_schema_change_fail_raises():
+    class FakeCursor:
+        def execute(self, *a, **k):
+            return None
+
+    target = TargetRelation(database=None, schema="transform", identifier="t")
+    df = pd.DataFrame({"id": [1], "new_col": [3]})
+    with pytest.raises(RuntimeError) as exc:
+        dataframe_io._apply_schema_change(
+            FakeCursor(),
+            target,
+            df,
+            target_columns=["id", "name"],
+            target_column_types={"id": "bigint", "name": "text"},
+            on_schema_change="fail",
+        )
+    assert "fail" in str(exc.value)
+
+
+def test_apply_schema_change_ignore_is_noop_for_drift():
+    class FakeCursor:
+        def __init__(self):
+            self.sql = []
+
+        def execute(self, query, params=None):
+            self.sql.append(query)
+
+    cur = FakeCursor()
+    target = TargetRelation(database=None, schema="transform", identifier="t")
+    df = pd.DataFrame({"id": [1], "extra": [9]})
+    cols, types = dataframe_io._apply_schema_change(
+        cur,
+        target,
+        df,
+        target_columns=["id", "name"],
+        target_column_types={"id": "bigint", "name": "text"},
+        on_schema_change="ignore",
+    )
+    assert cols == ["id", "name"]
+    assert cur.sql == []
+
+
+def test_apply_schema_change_rejects_unknown_strategy():
+    target = TargetRelation(database=None, schema="transform", identifier="t")
+    df = pd.DataFrame({"id": [1]})
+    with pytest.raises(RuntimeError):
+        dataframe_io._apply_schema_change(
+            object(),
+            target,
+            df,
+            target_columns=["id"],
+            target_column_types={"id": "bigint"},
+            on_schema_change="something_weird",
+        )
+
+
+def test_apply_schema_change_handles_non_string_column_labels():
+    # Regression: dataframes with integer column labels used to break the
+    # `chunk_df[new_in_df]` indexing because new_in_df held stringified names
+    # and pandas indexes by the raw label.
+    class FakeCursor:
+        def __init__(self):
+            self.sql = []
+
+        def execute(self, query, params=None):
+            self.sql.append(query)
+
+    cur = FakeCursor()
+    target = TargetRelation(database=None, schema="transform", identifier="t")
+    df = pd.DataFrame({1: [10], "name": ["a"]})  # column label 1 is an int
+    cols, types = dataframe_io._apply_schema_change(
+        cur,
+        target,
+        df,
+        target_columns=["name"],
+        target_column_types={"name": "text"},
+        on_schema_change="append_new_columns",
+    )
+    assert "1" in cols  # stringified into the target column list
+    assert types["1"] == "bigint"
+    assert any('add column "1"' in q.lower() for q in cur.sql)
+
+
+def test_apply_schema_change_drops_override_for_removed_column():
+    # Regression: if user removed a column from their model AND removed its
+    # entry from pybridge_column_types in the same change, the resolver used
+    # to fail because it validated overrides against the new chunk_df columns.
+    class FakeCursor:
+        def __init__(self):
+            self.sql = []
+
+        def execute(self, query, params=None):
+            self.sql.append(query)
+
+    cur = FakeCursor()
+    target = TargetRelation(database=None, schema="transform", identifier="t")
+    df = pd.DataFrame({"id": [1], "new_col": [3.14]})  # "old_col" gone
+    # Note: column_types still mentions old_col (stale entry); should not crash
+    cols, _ = dataframe_io._apply_schema_change(
+        cur,
+        target,
+        df,
+        target_columns=["id", "old_col"],
+        target_column_types={"id": "bigint", "old_col": "text"},
+        on_schema_change="sync_all_columns",
+        column_types={"old_col": "varchar(50)", "new_col": "double precision"},
+    )
+    assert "new_col" in cols
+    assert "old_col" not in cols

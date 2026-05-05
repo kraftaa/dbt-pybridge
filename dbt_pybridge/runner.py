@@ -33,6 +33,69 @@ class RelationFrame:
         relation_sql = f"(select {projection} from {self._relation_sql}) as pybridge_select"
         return RelationFrame(self._session, relation_sql)
 
+    def where(self, predicate_sql: str):
+        predicate = str(predicate_sql or "").strip()
+        if not predicate:
+            raise RuntimeError("dbt.ref(...).where(...) requires a non-empty SQL predicate string")
+        if ";" in predicate:
+            raise RuntimeError("dbt.ref(...).where(...) does not allow semicolons")
+        relation_sql = f"(select * from {self._relation_sql} where {predicate}) as pybridge_where"
+        return RelationFrame(self._session, relation_sql)
+
+    def join(self, other: "RelationFrame", on=None, how: str = "inner"):
+        if not isinstance(other, RelationFrame):
+            raise RuntimeError("dbt.ref(...).join(other, ...) requires another RelationFrame; pass dbt.ref('...')")
+        if self._session is not other._session:
+            raise RuntimeError("dbt.ref(...).join(...) requires both refs to share a session")
+        how_normalized = str(how or "").strip().lower()
+        valid_join_types = {"inner", "left", "right", "full", "full outer", "left outer", "right outer", "cross"}
+        if how_normalized not in valid_join_types:
+            raise RuntimeError(
+                f"Invalid join type {how!r}. Expected one of: {sorted(valid_join_types)}"
+            )
+        # Wrap each side in `select * from (...) as <alias>`. Without this
+        # wrap, chaining off a `.select()` / `.where()` (whose _relation_sql
+        # already ends with `as pybridge_<op>`) would produce two consecutive
+        # aliases (`as pybridge_select as pybridge_l`), which Postgres rejects.
+        left = f"(select * from {self._relation_sql}) as pybridge_l"
+        right = f"(select * from {other._relation_sql}) as pybridge_r"
+
+        if how_normalized == "cross":
+            if on:
+                raise RuntimeError("Cross joins do not take an `on=` argument")
+            relation_sql = (
+                f"(select * from {left} cross join {right}) as pybridge_join"
+            )
+            return RelationFrame(self._session, relation_sql)
+
+        if isinstance(on, str):
+            keys = [on]
+        elif on is None:
+            keys = []
+        else:
+            try:
+                keys = list(on)
+            except TypeError:
+                raise RuntimeError(
+                    f"Invalid `on=` value {on!r}; expected a column name or list of names"
+                ) from None
+        keys = [str(k).strip() for k in keys if str(k).strip()]
+        if not keys:
+            raise RuntimeError("dbt.ref(...).join(...) requires `on=` to be a column name or list of names")
+        for key in keys:
+            if ";" in key or '"' in key:
+                raise RuntimeError(f"Invalid join key {key!r}; column names must not contain ';' or '\"'")
+
+        # USING (col) keeps a single deduplicated copy of the join column in
+        # the output; if we used ON pybridge_l.k = pybridge_r.k with `select *`
+        # we'd get two columns named k, which fails our duplicate-column check.
+        using_columns = ", ".join(quote_ident(k) for k in keys)
+        relation_sql = (
+            f"(select * from {left} {how_normalized} join {right} using ({using_columns}))"
+            f" as pybridge_join"
+        )
+        return RelationFrame(self._session, relation_sql)
+
     def __getattr__(self, item):
         return getattr(self._load(), item)
 
@@ -80,6 +143,18 @@ class LocalPythonModelRunner:
     @staticmethod
     def _log(message: str) -> None:
         print(f"[pybridge] {message}")
+
+    @staticmethod
+    def _load_df_function(session: LocalPostgresSession):
+        # The callback dbt's compiled `dbtObj` calls for each `dbt.ref(...)` /
+        # `dbt.source(...)`. We normalize the 3-part identifier dbt renders
+        # ("db"."schema"."t") down to a 2-part one *here*, at the single entry
+        # point, so every subsequent .select()/.where()/.join() wraps an
+        # already-safe relation SQL and can't smuggle a cross-database
+        # qualifier into the resulting subquery.
+        def load(relation_sql: str) -> "RelationFrame":
+            return RelationFrame(session, session._normalize_relation_sql(relation_sql))
+        return load
 
     def _limits(self, cfg: Dict[str, Any]) -> ModelLimits:
         def _as_int(key: str, default: int) -> int:
@@ -248,6 +323,12 @@ class LocalPythonModelRunner:
         unique_key = self._normalize_unique_key(cfg.get("unique_key"))
         column_types = self._column_types(cfg)
         categorical_types = self._categorical_types(cfg)
+        on_schema_change = str(cfg.get("on_schema_change", "ignore")).lower()
+        sync_drop_cascade = self._cfg_value(cfg, "pybridge_sync_drop_cascade", None, False)
+        if isinstance(sync_drop_cascade, str):
+            sync_drop_cascade = sync_drop_cascade.strip().lower() in {"true", "t", "yes", "y", "on", "1"}
+        else:
+            sync_drop_cascade = bool(sync_drop_cascade)
         incremental_strategy = str(cfg.get("incremental_strategy", "default")).lower()
         if incremental_strategy == "default":
             incremental_strategy = "merge" if unique_key else "append"
@@ -273,10 +354,7 @@ class LocalPythonModelRunner:
             if dbt_obj_cls is None:
                 raise RuntimeError("Compiled Python model is missing dbtObj from dbt py_script_postfix")
 
-            def load_df_function(relation_sql: str):
-                return RelationFrame(session, relation_sql)
-
-            dbt_obj = dbt_obj_cls(load_df_function)
+            dbt_obj = dbt_obj_cls(self._load_df_function(session))
             model_result = model_fn(dbt_obj, session)
             if isinstance(model_result, RelationFrame):
                 model_result = model_result.as_dataframe()
@@ -314,6 +392,8 @@ class LocalPythonModelRunner:
                 column_types=column_types,
                 categorical_types=categorical_types,
                 logger=self._log,
+                on_schema_change=on_schema_change,
+                cascade_drops=sync_drop_cascade,
             )
         finally:
             session.close()

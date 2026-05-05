@@ -28,13 +28,36 @@ MVP scope for Python table + incremental + view materializations is implemented.
 pip install dbt-pybridge
 ```
 
-Requires Python `>=3.11` (3.11/3.12 recommended).
+Requires:
+- Python `>=3.11` (3.11/3.12 recommended)
+- Postgres `>=10` (CASCADE drops, `force_null` with column lists, partitioned-table relkind support)
+- `dbt-core >=1.10,<1.12`
 
-For local development of this repo only:
+Optional extras:
+- Machine-learning examples (`customers_kmeans`, `orders_anomaly_isoforest`, `products_similarity_tfidf`) require `scikit-learn`:
 
 ```bash
-pip install -e .
+pip install "dbt-pybridge[examples]"
 ```
+
+## Trust model
+
+`dbt-pybridge` runs your Python model code **in the same process** as the
+adapter via `exec()`. The model has full access to the database connection
+(read AND write), the local filesystem, environment variables, and any
+network the adapter can reach.
+
+Practical implications:
+
+- Treat `.py` models the same as any other application code — only run models
+  from sources you trust.
+- The `.select(...)` / `.where(...)` / `.join(..., on=...)` helpers accept raw
+  SQL fragments. The lightweight `;` and `"` guards are there to catch
+  accidental typos, **not** to sandbox untrusted SQL. If you're in a context
+  where authors of the python models can't be trusted, dbt-pybridge isn't the
+  right tool.
+- Your DB role's grants are the only real boundary. Run the dbt user with the
+  least privileges needed for the models in scope.
 
 ## Docs
 
@@ -75,6 +98,91 @@ def model(dbt, session):
     df = dbt.ref("stg_orders").select("order_id, amount, customer_id")
     return df
 ```
+
+## SQL pushdown helpers
+
+`dbt.ref(...)` returns a `RelationFrame` that you can chain SQL clauses onto
+*before* the data is pulled into Python. Each helper wraps the previous SQL in
+a subquery, so they compose. Use them when you only need a slice of upstream:
+
+```python
+def model(dbt, session):
+    # Column projection — pushed into Postgres
+    cols = dbt.ref("stg_orders").select("order_id, amount, customer_id")
+
+    # Row filter — pushed into Postgres
+    big = dbt.ref("stg_orders").where("amount > 100")
+
+    # Join two refs in Postgres before loading
+    enriched = (
+        dbt.ref("stg_orders")
+           .join(dbt.ref("stg_customers"), on="customer_id", how="left")
+    )
+    # Multi-key joins:
+    pairs = dbt.ref("a").join(dbt.ref("b"), on=["customer_id", "site_id"])
+    # Cross join:
+    cartesian = dbt.ref("a").join(dbt.ref("b"), on=None, how="cross")
+
+    return enriched.as_dataframe()
+```
+
+Notes:
+- All three reject `;` and (for joins) `"` to keep accidental SQL injection
+  out of model code; user code is already trusted (it runs via `exec`), but
+  these guards catch typos.
+- `.join()` uses Postgres' `USING (col, ...)` so the join column appears once
+  in the output (matches pandas/polars merge semantics).
+- The full DataFrame still loads into Python on `as_dataframe()`/`iter_batches`;
+  the pushdowns just shrink what's pulled.
+
+## Schema evolution for incremental models
+
+If your incremental model adds/removes columns over time, set
+`on_schema_change` so dbt-pybridge reconciles the target table automatically:
+
+```python
+def model(dbt, session):
+    dbt.config(
+        materialized="incremental",
+        unique_key="order_id",
+        on_schema_change="append_new_columns",  # default is "ignore"
+    )
+    ...
+```
+
+Supported values:
+
+| value | behavior |
+|---|---|
+| `ignore` (default) | fail on column mismatch (preserves existing target schema) |
+| `fail` | explicit fail with details on what drifted |
+| `append_new_columns` | `ALTER TABLE ... ADD COLUMN` for any new dataframe column |
+| `sync_all_columns` | append new columns AND drop columns missing from the model |
+
+When `ignore` raises, the error message lists exactly which columns are
+missing or new and points you at `append_new_columns` or `--full-refresh`.
+
+By default `sync_all_columns` drops columns with plain `ALTER TABLE ... DROP
+COLUMN` (PostgreSQL's default `RESTRICT` behavior). If a removed column has
+dependents (views, materialized views, indexes, generated columns), Postgres
+will refuse the drop and you'll get a clear error. To resolve, either:
+
+- drop the dependents yourself and rerun,
+- run `dbt run --full-refresh` for a clean rebuild, or
+- opt into cascading drops with `pybridge_sync_drop_cascade=True`:
+
+```python
+dbt.config(
+    materialized="incremental",
+    on_schema_change="sync_all_columns",
+    pybridge_sync_drop_cascade=True,  # ⚠️ silently drops dependents
+)
+```
+
+> **⚠️ `pybridge_sync_drop_cascade=True` is destructive.** It uses
+> `DROP COLUMN ... CASCADE`, which silently removes any dependent objects —
+> including ones not managed by dbt. Only enable it when you're sure that's
+> what you want.
 
 ## How to create Python models
 
@@ -131,6 +239,9 @@ Set model-level configs via `dbt.config(...)` in your python model:
   - `{"id": "numeric(18,0)", "created_at": "timestamp", "payload": "jsonb"}`
 - `pybridge_categorical_types`: optional categorical-column enum type map, for example:
   - `{"status": "status_enum", "tier": "tier_enum"}`
+- `pybridge_sync_drop_cascade`: when `on_schema_change='sync_all_columns'`, controls
+  whether dropped columns use `DROP COLUMN ... CASCADE` (default `false` — drops
+  fail if dependents exist; opt in to silently drop dependents)
 
 Legacy `localpy_*` keys are still accepted for backward compatibility.
 

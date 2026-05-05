@@ -517,6 +517,10 @@ def _resolve_column_sql_types(
             for col, pg_type in column_types.items()
         }
 
+    # Map stringified names back to the original df labels so we can index the
+    # dataframe correctly even if column labels aren't strings (e.g. integers).
+    labels_by_name = {str(label): label for label in df.columns}
+
     categorical_type_overrides: Dict[str, str] = {}
     if categorical_types:
         unknown = sorted(set(categorical_types) - known_columns)
@@ -526,7 +530,7 @@ def _resolve_column_sql_types(
                 f"Unknown keys: {unknown}; dataframe columns: {sorted(known_columns)}"
             )
         for col, pg_type in categorical_types.items():
-            series = df[str(col)]
+            series = df[labels_by_name[str(col)]]
             if not isinstance(series.dtype, pd.CategoricalDtype):
                 raise RuntimeError(
                     "pybridge_categorical_types (legacy localpy_categorical_types) can only be used for categorical columns. "
@@ -542,7 +546,7 @@ def _resolve_column_sql_types(
         elif col_name in categorical_type_overrides:
             resolved[col_name] = categorical_type_overrides[col_name]
         else:
-            resolved[col_name] = postgres_type_for_series(df[col_name])
+            resolved[col_name] = postgres_type_for_series(df[col])
     return resolved
 
 
@@ -669,9 +673,22 @@ def _align_and_validate_columns(df, target_columns: Sequence[str]):
     df_labels = list(df.columns)
     df_columns = [str(col) for col in df_labels]
     if set(df_columns) != set(target_columns):
+        df_set = set(df_columns)
+        target_set = set(target_columns)
+        missing_from_model = sorted(target_set - df_set)
+        new_in_model = sorted(df_set - target_set)
+        details = []
+        if missing_from_model:
+            details.append(f"missing from model output: {missing_from_model}")
+        if new_in_model:
+            details.append(
+                f"new in model output (would need on_schema_change='append_new_columns' "
+                f"or --full-refresh): {new_in_model}"
+            )
         raise RuntimeError(
             "Incremental Python model columns must match target table columns exactly. "
-            f"Target columns: {list(target_columns)}; model columns: {df_columns}"
+            + "; ".join(details)
+            + f". Target columns: {list(target_columns)}; model columns: {df_columns}"
         )
     if list(df_columns) == list(target_columns):
         return df
@@ -766,6 +783,93 @@ def _delete_insert_from_temp(cur, target: TargetRelation, temp_sql: str, columns
     )
 
 
+_VALID_ON_SCHEMA_CHANGE = {"ignore", "fail", "append_new_columns", "sync_all_columns"}
+
+
+def _apply_schema_change(
+    cur,
+    target: TargetRelation,
+    chunk_df,
+    target_columns: Sequence[str],
+    target_column_types: Dict[str, str],
+    on_schema_change: str,
+    column_types: Optional[Dict[str, str]] = None,
+    categorical_types: Optional[Dict[str, str]] = None,
+    cascade_drops: bool = False,
+) -> Tuple[List[str], Dict[str, str]]:
+    """Reconcile dataframe columns vs target columns according to dbt's
+    `on_schema_change` setting. Returns the (possibly updated) target columns
+    and types. Mutates the target table when columns need to be added/dropped.
+    """
+    if on_schema_change not in _VALID_ON_SCHEMA_CHANGE:
+        raise RuntimeError(
+            f"Unsupported on_schema_change={on_schema_change!r}; "
+            f"expected one of: {sorted(_VALID_ON_SCHEMA_CHANGE)}"
+        )
+    df_columns = [str(col) for col in chunk_df.columns]
+    df_set = set(df_columns)
+    target_set = set(target_columns)
+    new_in_df = [c for c in df_columns if c not in target_set]
+    missing_in_df = [c for c in target_columns if c not in df_set]
+
+    if not new_in_df and not missing_in_df:
+        return list(target_columns), dict(target_column_types)
+
+    if on_schema_change == "ignore":
+        return list(target_columns), dict(target_column_types)
+    if on_schema_change == "fail":
+        raise RuntimeError(
+            "Incremental Python model schema drift detected with "
+            f"on_schema_change='fail'. New in model: {new_in_df}; "
+            f"missing from model: {missing_in_df}."
+        )
+
+    target_sql = target.render()
+    updated_columns = list(target_columns)
+    updated_types = dict(target_column_types)
+
+    if new_in_df:
+        # Only resolve types for the new columns. Resolving the whole dataframe
+        # would re-validate user-supplied column_types/categorical_types against
+        # df.columns, which fails if a previous override referenced a column
+        # that the user has just removed from their model output.
+        # Map stringified names back to the original labels so dataframes with
+        # non-string column labels (e.g. integer columns) work correctly.
+        labels_by_name = {str(label): label for label in chunk_df.columns}
+        new_in_df_labels = [labels_by_name[name] for name in new_in_df]
+        new_df = chunk_df[new_in_df_labels]
+        scoped_column_types = (
+            {k: v for k, v in column_types.items() if k in new_in_df}
+            if column_types else None
+        )
+        scoped_categorical_types = (
+            {k: v for k, v in categorical_types.items() if k in new_in_df}
+            if categorical_types else None
+        )
+        inferred = _resolve_column_sql_types(
+            new_df,
+            column_types=scoped_column_types,
+            categorical_types=scoped_categorical_types,
+        )
+        for col in new_in_df:
+            col_type = inferred[col]
+            cur.execute(f"alter table {target_sql} add column {quote_ident(col)} {col_type}")
+            updated_columns.append(col)
+            updated_types[col] = col_type
+
+    if on_schema_change == "sync_all_columns" and missing_in_df:
+        # Default to RESTRICT (the SQL default — same as plain DROP COLUMN).
+        # If a dependent exists, Postgres raises a clear error pointing the
+        # user at CASCADE; flipping pybridge_sync_drop_cascade=true opts in.
+        drop_suffix = " cascade" if cascade_drops else ""
+        for col in missing_in_df:
+            cur.execute(f"alter table {target_sql} drop column {quote_ident(col)}{drop_suffix}")
+            updated_columns.remove(col)
+            updated_types.pop(col, None)
+
+    return updated_columns, updated_types
+
+
 def _apply_incremental_chunk(
     cur,
     target: TargetRelation,
@@ -774,6 +878,8 @@ def _apply_incremental_chunk(
     unique_key: Optional[Sequence[str]],
     column_types: Optional[Dict[str, str]] = None,
     categorical_types: Optional[Dict[str, str]] = None,
+    on_schema_change: str = "ignore",
+    cascade_drops: bool = False,
 ) -> int:
     target_columns_with_types = _table_columns_with_types(cur, target)
     target_columns = [name for name, _ in target_columns_with_types]
@@ -784,17 +890,8 @@ def _apply_incremental_chunk(
             column_types=column_types,
             categorical_types=categorical_types,
         )
-        # First incremental run: create target table even if this chunk has zero rows,
-        # so downstream index creation/grants can succeed.
-        if chunk_df.empty:
-            _create_table_for_dataframe(
-                cur,
-                target,
-                chunk_df,
-                replace=True,
-                column_types=first_run_types,
-            )
-            return 0
+        # First incremental run: create the target table even on an empty chunk,
+        # so downstream index creation / grants on this run still find a table.
         _create_table_for_dataframe(
             cur,
             target,
@@ -802,10 +899,24 @@ def _apply_incremental_chunk(
             replace=True,
             column_types=first_run_types,
         )
+        if chunk_df.empty:
+            return 0
         return _copy_dataframe(cur, target, chunk_df, column_sql_types=first_run_types)
 
     if chunk_df.empty:
         return 0
+
+    target_columns, target_column_types = _apply_schema_change(
+        cur,
+        target,
+        chunk_df,
+        target_columns,
+        target_column_types,
+        on_schema_change,
+        column_types=column_types,
+        categorical_types=categorical_types,
+        cascade_drops=cascade_drops,
+    )
 
     aligned = _align_and_validate_columns(chunk_df, target_columns)
     if incremental_strategy == "append":
@@ -848,6 +959,8 @@ def write_model_result(
     column_types: Optional[Dict[str, str]] = None,
     categorical_types: Optional[Dict[str, str]] = None,
     logger: Optional[Callable[[str], None]] = None,
+    on_schema_change: str = "ignore",
+    cascade_drops: bool = False,
 ) -> int:
     if result is None:
         raise RuntimeError("Python model returned None; expected dataframe or iterable of dataframes")
@@ -886,6 +999,8 @@ def write_model_result(
                     unique_key=unique_key,
                     column_types=column_types,
                     categorical_types=categorical_types,
+                    on_schema_change=on_schema_change,
+                    cascade_drops=cascade_drops,
                 )
         conn.commit()
         return rows_written
@@ -935,6 +1050,7 @@ def write_model_result(
                         unique_key=unique_key,
                         column_types=column_types,
                         categorical_types=categorical_types,
+                        on_schema_change=on_schema_change,
                     )
                     created = True
 
