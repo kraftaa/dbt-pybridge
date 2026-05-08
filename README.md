@@ -1,16 +1,52 @@
 # dbt-pybridge
 
-Run dbt Python models on Postgres.
+Run dbt Python models on Postgres, without Snowpark, Spark, or warehouse-native Python runtimes.
 
-`dbt-pybridge` executes Python locally or in CI, reads inputs from Postgres via `dbt.ref()` / `dbt.source()`, then writes results back to Postgres.
+`dbt-pybridge` executes Python on your local machine or CI runner, loads upstream dbt refs/sources from Postgres into pandas/polars, then materializes results back to Postgres (`table`, `view`, `incremental`).
 
-It works by:
-- compiling `.py` models through dbt
-- executing Python locally (developer laptop or CI runner)
-- loading `dbt.ref()` / `dbt.source()` data into pandas/polars
-- writing the returned dataframe back into Postgres
+## 30-second example
 
-This is useful when you want Python transforms in dbt without a warehouse-native Python runtime (for example Spark/Snowpark).
+```python
+def model(dbt, session):
+    dbt.config(materialized="table")
+    orders = dbt.ref("stg_orders")
+    orders["amount_usd"] = orders["amount"] * 1.1
+    return orders
+```
+
+```bash
+dbt run -s my_python_model
+```
+
+## Where Python runs
+
+```text
+dbt SQL model
+      ↓
+dbt.ref() / dbt.source()
+      ↓
+Postgres query
+      ↓
+pandas / polars transform (local machine or CI runner)
+      ↓
+write back to Postgres
+      ↓
+downstream dbt SQL models
+```
+
+## Useful for
+
+- ML feature engineering
+- Python-only transformations
+- lightweight AI/LLM enrichment (small/medium volumes)
+- dataframe workflows inside existing dbt DAGs
+- teams using Postgres/RDS without warehouse Python runtimes
+
+## Not intended for
+
+- massive distributed compute
+- Spark-scale workloads
+- replacing SQL-first transformations
 
 ## Status
 
