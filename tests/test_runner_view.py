@@ -17,61 +17,38 @@ def test_view_backing_relation_name():
     assert len(backing.identifier) <= 63
 
 
-def test_runner_view_materialization_uses_backing_table(monkeypatch):
-    class FakeConn:
-        pass
+def test_runner_view_materialization_routes_through_swap(monkeypatch):
+    """The view branch in run() must hand off to _materialize_view_via_swap
+    with the right view target and the deterministic backing target."""
 
     class FakeSession:
         def __init__(self, credentials, limits, dataframe_backend, logger=None):
-            self.conn = FakeConn()
+            self.conn = object()
 
         def close(self):
             return None
 
-    calls = {}
-    call_order = []
+    captured = {}
+
+    def fake_swap(self, conn, view_target, backing_target, write_backing):
+        captured["view_target"] = view_target
+        captured["backing_target"] = backing_target
+        # Exercise the write_backing callback to confirm it's wired up correctly.
+        captured["rows"] = write_backing(backing_target)
+        return captured["rows"]
 
     def fake_write_model_result(
-        conn,
-        target,
-        result,
-        batch_size,
-        materialized,
-        incremental_strategy,
-        unique_key,
-        column_types,
-        categorical_types,
-        logger,
+        conn, target, result, batch_size, materialized,
+        incremental_strategy, unique_key, column_types,
+        categorical_types, logger,
     ):
-        call_order.append("write")
-        calls["write"] = {
-            "conn": conn,
-            "target": target,
-            "materialized": materialized,
-            "incremental_strategy": incremental_strategy,
-            "unique_key": unique_key,
-            "column_types": column_types,
-            "categorical_types": categorical_types,
-            "rows": len(result),
-        }
+        captured["write_target"] = target
+        captured["write_materialized"] = materialized
         return len(result)
-
-    def fake_create_or_replace_view(self, conn, view_target, backing_target):
-        call_order.append("create_view")
-        calls["view"] = {
-            "conn": conn,
-            "view_target": view_target,
-            "backing_target": backing_target,
-        }
-
-    def fake_drop_existing_relation(self, conn, relation):
-        call_order.append("drop")
-        calls["drop"] = {"conn": conn, "relation": relation}
 
     monkeypatch.setattr(runner_module, "LocalPostgresSession", FakeSession)
     monkeypatch.setattr(runner_module, "write_model_result", fake_write_model_result)
-    monkeypatch.setattr(LocalPythonModelRunner, "_create_or_replace_view", fake_create_or_replace_view)
-    monkeypatch.setattr(LocalPythonModelRunner, "_drop_existing_relation", fake_drop_existing_relation)
+    monkeypatch.setattr(LocalPythonModelRunner, "_materialize_view_via_swap", fake_swap)
 
     compiled_code = """
 import pandas as pd
@@ -87,7 +64,6 @@ class dbtObj:
 def model(dbt, session):
     return pd.DataFrame({"id": [1, 2]})
 """
-
     parsed_model = {
         "database": "postgres",
         "schema": "transform",
@@ -95,20 +71,103 @@ def model(dbt, session):
         "name": "bronze_beacons_python",
         "config": {"materialized": "view"},
     }
-
-    runner = LocalPythonModelRunner(credentials=object(), parsed_model=parsed_model, compiled_code=compiled_code)
+    runner = LocalPythonModelRunner(
+        credentials=object(), parsed_model=parsed_model, compiled_code=compiled_code,
+    )
     rows = runner.run()
 
     assert rows == 2
-    assert calls["write"]["materialized"] == "table"
-    assert calls["write"]["target"].identifier.startswith("__dbt_pybridge_view_")
-    assert calls["view"]["view_target"].identifier == "bronze_beacons_python"
-    assert calls["view"]["backing_target"].identifier.startswith("__dbt_pybridge_view_")
-    # Drop must happen before backing-table rebuild, otherwise the existing
-    # view depends on the backing table and the drop inside write_model_result
-    # fails with a dependency error.
-    assert call_order == ["drop", "write", "create_view"]
-    assert calls["drop"]["relation"].identifier == "bronze_beacons_python"
+    assert captured["view_target"].identifier == "bronze_beacons_python"
+    assert captured["backing_target"].identifier.startswith("__dbt_pybridge_view_")
+    # write_backing(intermediate) inside the swap should call write_model_result
+    # with materialized='table' and the intermediate identifier we passed.
+    assert captured["write_materialized"] == "table"
+    assert captured["write_target"] is captured["backing_target"]
+
+
+def test_materialize_view_via_swap_rename_swap_order(monkeypatch):
+    """The swap helper must (1) build new backing, (2) create intermediate
+    view, (3) RENAME existing view → backup, (4) RENAME intermediate → target,
+    (5) DROP backup, (6) DROP old backing, (7) RENAME intermediate backing →
+    final. This ordering is what makes the rename-swap atomic-ish (matches
+    dbt-core's Postgres convention)."""
+
+    class FakeCursor:
+        def __init__(self, conn):
+            self.conn = conn
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=None):
+            self.conn.sql.append(sql.strip())
+
+    class FakeConn:
+        def __init__(self):
+            self.sql = []
+            self.commits = 0
+
+        def cursor(self):
+            return FakeCursor(self)
+
+        def commit(self):
+            self.commits += 1
+
+    runner = LocalPythonModelRunner.__new__(LocalPythonModelRunner)
+    conn = FakeConn()
+    view_target = TargetRelation(database=None, schema="transform", identifier="my_view")
+    backing_target = TargetRelation(
+        database=None, schema="transform", identifier="__dbt_pybridge_view_my_view_aaaa1111",
+    )
+
+    def fake_relation_kind(self, conn, relation):
+        # Only the live target slot starts as a view.
+        if relation.identifier == "my_view":
+            return "v"
+        # Backup view and stable backing exist when cleanup runs after swap.
+        return "v" if relation.identifier.endswith("__pybbkup") else (
+            "r" if relation.identifier == backing_target.identifier else None
+        )
+
+    def fake_drop(self, conn, relation):
+        # Track drops so the test can assert they happened.
+        conn.sql.append(f"DROP {relation.identifier}")
+        conn.commits += 1
+
+    monkeypatch.setattr(LocalPythonModelRunner, "_relation_kind", fake_relation_kind)
+    monkeypatch.setattr(LocalPythonModelRunner, "_drop_existing_relation", fake_drop)
+
+    write_calls = []
+
+    def write_backing(intermediate_backing):
+        write_calls.append(intermediate_backing)
+        return 7
+
+    rows = runner._materialize_view_via_swap(
+        conn,
+        view_target=view_target,
+        backing_target=backing_target,
+        write_backing=write_backing,
+    )
+
+    assert rows == 7
+    assert len(write_calls) == 1
+    assert write_calls[0].identifier.endswith("__tmp")  # intermediate backing
+
+    text = "\n".join(conn.sql)
+    # New view at intermediate name, pointing at intermediate backing.
+    assert "create view" in text.lower()
+    assert "__pybtmp" in text
+    # Rename existing → backup AND intermediate → target both present.
+    assert "rename to \"my_view__pybbkup\"" in text
+    assert "rename to \"my_view\"" in text
+    # Final rename: intermediate backing → stable backing name.
+    assert f'rename to "{backing_target.identifier}"' in text
+    # Backup view dropped after swap.
+    assert any("__pybbkup" in s for s in conn.sql if s.startswith("DROP "))
 
 
 def test_create_or_replace_view_emits_create_view_only():

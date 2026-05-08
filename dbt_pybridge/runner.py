@@ -256,6 +256,27 @@ class LocalPythonModelRunner:
             identifier=identifier,
         )
 
+    @staticmethod
+    def _suffix_relation(relation: TargetRelation, suffix: str) -> TargetRelation:
+        # Postgres identifiers are limited to 63 chars (NAMEDATALEN-1). Truncate
+        # the base if the suffix would push us over so two long-but-different
+        # base names don't collide after silent server-side truncation.
+        max_base = max(1, 63 - len(suffix))
+        return TargetRelation(
+            database=relation.database,
+            schema=relation.schema,
+            identifier=relation.identifier[:max_base] + suffix,
+        )
+
+    def _view_intermediate_relation(self, view_target: TargetRelation) -> TargetRelation:
+        return self._suffix_relation(view_target, "__pybtmp")
+
+    def _view_backup_relation(self, view_target: TargetRelation) -> TargetRelation:
+        return self._suffix_relation(view_target, "__pybbkup")
+
+    def _backing_intermediate_relation(self, backing_target: TargetRelation) -> TargetRelation:
+        return self._suffix_relation(backing_target, "__tmp")
+
     def _relation_kind(self, conn, relation: TargetRelation) -> Optional[str]:
         with conn.cursor() as cur:
             if relation.schema:
@@ -303,8 +324,8 @@ class LocalPythonModelRunner:
             cur.execute(drop_sql)
         conn.commit()
 
-    def _create_or_replace_view(self, conn, view_target: TargetRelation, backing_table: TargetRelation) -> None:
-        # Caller is responsible for dropping any pre-existing relation.
+    def _create_view(self, conn, view_target: TargetRelation, backing_table: TargetRelation) -> None:
+        """Plain `CREATE VIEW`. Caller must ensure no relation exists at view_target."""
         view_sql = view_target.render()
         backing_sql = backing_table.render()
         with conn.cursor() as cur:
@@ -312,6 +333,94 @@ class LocalPythonModelRunner:
                 cur.execute(f"create schema if not exists {quote_ident(view_target.schema)}")
             cur.execute(f"create view {view_sql} as select * from {backing_sql}")
         conn.commit()
+
+    # Kept under the old name so external callers (and the existing test) still
+    # work. Internally just delegates to _create_view.
+    def _create_or_replace_view(self, conn, view_target: TargetRelation, backing_table: TargetRelation) -> None:
+        self._create_view(conn, view_target, backing_table)
+
+    def _materialize_view_via_swap(
+        self,
+        conn,
+        view_target: TargetRelation,
+        backing_target: TargetRelation,
+        write_backing,
+    ) -> int:
+        """Atomic-ish view materialization that mirrors dbt-core's Postgres pattern.
+
+        Plain DROP+CREATE has a window where the view doesn't exist; on the
+        Postgres path dbt-core uses a rename-swap so the user-facing name is
+        always resolvable to *something*. We do the same here, with the extra
+        wrinkle that we own the backing table too:
+
+            1. Cleanup any leftovers from a prior failed run (intermediate
+               view, backup view, intermediate backing).
+            2. Build the new backing at an intermediate name (via
+               `write_backing(intermediate_backing)`, which is just
+               write_model_result with materialized='table').
+            3. CREATE VIEW <intermediate_view> AS SELECT * FROM
+               <intermediate_backing>.
+            4. In a single transaction, rename existing view (if any) to
+               backup, then rename intermediate to target. After commit,
+               readers see the new view atomically.
+            5. Drop the backup view (which still depended on the old backing).
+            6. Drop the old backing under its stable name.
+            7. Rename the intermediate backing into that stable name.
+               PG view dependencies follow OIDs, not names, so step 7 doesn't
+               break the (already-published) new view.
+        """
+        intermediate_view = self._view_intermediate_relation(view_target)
+        backup_view = self._view_backup_relation(view_target)
+        intermediate_backing = self._backing_intermediate_relation(backing_target)
+
+        # 1. Cleanup leftovers from a prior failed run.
+        for leftover in (intermediate_view, backup_view, intermediate_backing):
+            self._drop_existing_relation(conn, leftover)
+
+        # 2. Build the new backing at the intermediate name.
+        rows_written = write_backing(intermediate_backing)
+
+        # 3. Build the new view at the intermediate name, pointing at the new
+        #    backing.
+        self._create_view(conn, intermediate_view, intermediate_backing)
+
+        # Whatever sits at the view target now: a view (rename to backup), a
+        # non-view (drop with CASCADE — same behavior as dbt-core when an
+        # incompatible relation occupies the target slot), or nothing.
+        existing_kind = self._relation_kind(conn, view_target)
+        existing_is_view = existing_kind == "v"
+        if existing_kind is not None and not existing_is_view:
+            self._drop_existing_relation(conn, view_target)
+            existing_is_view = False
+
+        # 4. Atomic swap (rename existing → backup, intermediate → target).
+        with conn.cursor() as cur:
+            if existing_is_view:
+                cur.execute(
+                    f"alter view {view_target.render()} rename to {quote_ident(backup_view.identifier)}"
+                )
+            cur.execute(
+                f"alter view {intermediate_view.render()} rename to {quote_ident(view_target.identifier)}"
+            )
+        conn.commit()
+
+        # 5. Drop the backup view (no-op if there was no prior view).
+        if existing_is_view:
+            self._drop_existing_relation(conn, backup_view)
+
+        # 6. Drop the old backing under the stable name (no-op on first run).
+        self._drop_existing_relation(conn, backing_target)
+
+        # 7. Rename intermediate backing into the stable name. The new view's
+        #    pg_rewrite rule references the backing's OID; the rename
+        #    preserves OID, so the view continues to resolve correctly.
+        with conn.cursor() as cur:
+            cur.execute(
+                f"alter table {intermediate_backing.render()} rename to {quote_ident(backing_target.identifier)}"
+            )
+        conn.commit()
+
+        return rows_written
 
     def run(self) -> int:
         cfg = self._model_config()
@@ -361,25 +470,27 @@ class LocalPythonModelRunner:
             target = self._target_relation()
             if materialized == "view":
                 backing_target = self._view_backing_relation(target)
-                # Drop the user-facing view first; otherwise the backing-table
-                # replace below fails with a dependency error, and we'd also be
-                # constrained by `CREATE OR REPLACE VIEW`'s no-rename rule on
-                # the rebuild.
-                self._drop_existing_relation(session.conn, target)
-                rows_written = write_model_result(
-                    conn=session.conn,
-                    target=backing_target,
-                    result=model_result,
-                    batch_size=limits.batch_size,
-                    materialized="table",
-                    incremental_strategy="append",
-                    unique_key=None,
-                    column_types=column_types,
-                    categorical_types=categorical_types,
-                    logger=self._log,
+
+                def _write_backing(intermediate_backing):
+                    return write_model_result(
+                        conn=session.conn,
+                        target=intermediate_backing,
+                        result=model_result,
+                        batch_size=limits.batch_size,
+                        materialized="table",
+                        incremental_strategy="append",
+                        unique_key=None,
+                        column_types=column_types,
+                        categorical_types=categorical_types,
+                        logger=self._log,
+                    )
+
+                return self._materialize_view_via_swap(
+                    session.conn,
+                    view_target=target,
+                    backing_target=backing_target,
+                    write_backing=_write_backing,
                 )
-                self._create_or_replace_view(session.conn, target, backing_target)
-                return rows_written
 
             return write_model_result(
                 conn=session.conn,
