@@ -98,6 +98,12 @@ def test_limits_rejects_invalid_boolean_strings():
         runner._limits({"pybridge_allow_large_tables": "maybe"})
 
 
+def test_limits_rejects_zero_batch_size():
+    runner = LocalPythonModelRunner.__new__(LocalPythonModelRunner)
+    with pytest.raises(RuntimeError, match="expected > 0"):
+        runner._limits({"pybridge_batch_size": 0})
+
+
 def test_align_validate_columns_reorders():
     df = pd.DataFrame({"b": [1], "a": [2]})
     out = _align_and_validate_columns(df, ["a", "b"])

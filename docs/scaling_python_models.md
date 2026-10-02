@@ -113,6 +113,8 @@ This keeps Python focused and prevents local runtime bottlenecks.
 Relevant configs:
 - `pybridge_max_rows`, `pybridge_warn_rows`
 - `pybridge_max_bytes`, `pybridge_warn_bytes`
+- `pybridge_max_total_rows`, `pybridge_warn_total_rows`
+- `pybridge_max_total_bytes`, `pybridge_warn_total_bytes`
 - `pybridge_allow_large_tables`
 - `pybridge_chunked_mode`
 - `pybridge_batch_size`

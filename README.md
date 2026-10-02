@@ -75,6 +75,11 @@ Optional extras:
 ```bash
 pip install "dbt-pybridge[examples]"
 ```
+- Spill-backed cross-connection joins require DuckDB:
+
+```bash
+pip install "dbt-pybridge[federation]"
+```
 
 ## Trust model
 
@@ -98,6 +103,8 @@ Practical implications:
 ## Docs
 
 - [Scaling Python models](docs/scaling_python_models.md) — SQL vs Python decision rules, chunking/incremental patterns, and debugging checklist.
+- [Multi-database Python models](docs/multi_database_models.md) — route sources to named Postgres connections and join locally or with spill-to-disk federation.
+- [Changelog](CHANGELOG.md) — release notes and compatibility-impacting changes.
 
 ## Profile
 
@@ -168,8 +175,9 @@ Notes:
   these guards catch typos.
 - `.join()` uses Postgres' `USING (col, ...)` so the join column appears once
   in the output (matches pandas/polars merge semantics).
-- The full DataFrame still loads into Python on `as_dataframe()`/`iter_batches`;
-  the pushdowns just shrink what's pulled.
+- Pushdowns reduce what gets pulled from Postgres, but data is still processed
+  in the local/CI Python runtime. For large inputs, use `iter_batches()` (and
+  optionally `pybridge_chunked_mode`) to bound memory.
 
 ## Schema evolution for incremental models
 
@@ -220,6 +228,20 @@ dbt.config(
 > including ones not managed by dbt. Only enable it when you're sure that's
 > what you want.
 
+## Destructive operations and blast radius
+
+Some materialization paths intentionally use destructive DDL to keep model
+rebuilds unblocked:
+
+- relation replacement can issue `DROP ... CASCADE` before recreating targets
+- `on_schema_change='sync_all_columns'` may drop columns
+- `pybridge_sync_drop_cascade=True` upgrades those column drops to
+  `DROP COLUMN ... CASCADE`
+
+Operationally, this means your DB role permissions define the blast radius.
+Run dbt-pybridge with least-privileged credentials and treat production
+dependencies carefully.
+
 ## How to create Python models
 
 1. Create `models/<name>_python.py`.
@@ -255,8 +277,8 @@ def model(dbt, session):
 
 Runtime logging includes progress messages such as:
 
-- `[pybridge] Loading "transform"."stg_orders" (2,300,000 rows, 120.0 MB)`
-- `[pybridge] Processing batch 1, rows=100000`
+- `[pybridge] [target] Loaded "transform"."stg_orders" (230,000 rows, 120.0 MB)`
+- `[pybridge] [target] Processing batch 1, rows=100000`
 - `[pybridge] Writing batch 1, rows=100000`
 
 ## Runtime configs
@@ -266,9 +288,13 @@ Set model-level configs via `dbt.config(...)` in your python model:
 - `pybridge_dataframe_backend`: `pandas` (default) or `polars`
 - `pybridge_max_rows`: hard limit before failure (default `1_000_000`)
 - `pybridge_warn_rows`: warning threshold (default `200_000`)
-- `pybridge_max_bytes`: hard estimated table-size limit before failure (default `536870912`, 512MB)
-- `pybridge_warn_bytes`: warning estimated table-size threshold (default `134217728`, 128MB)
-- `pybridge_allow_large_tables`: bypass hard row limit (default `false`)
+- `pybridge_max_bytes`: hard loaded-dataframe size limit per input (default `536870912`, 512MB)
+- `pybridge_warn_bytes`: loaded-dataframe warning threshold per input (default `134217728`, 128MB)
+- `pybridge_max_total_rows`: hard row limit across all model inputs (default `1_000_000`)
+- `pybridge_warn_total_rows`: aggregate row warning threshold (default `200_000`)
+- `pybridge_max_total_bytes`: hard dataframe-size limit across all inputs (default `536870912`, 512MB)
+- `pybridge_warn_total_bytes`: aggregate dataframe-size warning threshold (default `134217728`, 128MB)
+- `pybridge_allow_large_tables`: bypass hard per-input and aggregate limits (default `false`)
 - `pybridge_chunked_mode`: allow oversized input only when using `iter_batches` (default `false`)
 - `pybridge_batch_size`: default batch size for `iter_batches` (default `100_000`)
 - `pybridge_column_types`: optional explicit type map for created target tables, for example:
@@ -280,6 +306,19 @@ Set model-level configs via `dbt.config(...)` in your python model:
   fail if dependents exist; opt in to silently drop dependents)
 
 Legacy `localpy_*` keys are still accepted for backward compatibility.
+
+### Built-in runtime guardrails
+
+These limits are a core safety mechanism for local/CI execution:
+
+- warning thresholds: `pybridge_warn_rows`, `pybridge_warn_bytes`
+- hard-fail thresholds: `pybridge_max_rows`, `pybridge_max_bytes`
+- model-wide thresholds: `pybridge_warn_total_rows`,
+  `pybridge_warn_total_bytes`, `pybridge_max_total_rows`,
+  `pybridge_max_total_bytes`
+- explicit opt-ins for larger loads: `pybridge_allow_large_tables`,
+  `pybridge_chunked_mode`
+- bounded chunk size control: `pybridge_batch_size`
 
 ## Type inference details
 
