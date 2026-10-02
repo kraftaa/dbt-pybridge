@@ -81,7 +81,7 @@ def databases():
         admin.close()
 
 
-def _run_dbt(tmp_path, models, billing_extra=""):
+def _run_dbt(tmp_path, models, billing_extra="", extra_tables=None):
     project = tmp_path / "project"
     model_dir = project / "models"
     profiles = tmp_path / "profiles"
@@ -121,6 +121,13 @@ def _run_dbt(tmp_path, models, billing_extra=""):
             tables:
               - name: events
     """).strip() + "\n")
+    extra_tables = extra_tables or {}
+    sources_path = model_dir / "sources.yml"
+    sources_text = sources_path.read_text()
+    for anchor, source in (("      - name: signups\n", "app"), ("      - name: payments\n", "billing")):
+        extra = "".join(f"      - name: {table}\n" for table in extra_tables.get(source, []))
+        sources_text = sources_text.replace(anchor, anchor + extra)
+    sources_path.write_text(sources_text)
     for name, body in models.items():
         (model_dir / f"{name}.py").write_text(textwrap.dedent(body).strip() + "\n")
 
@@ -370,3 +377,34 @@ def model(dbt, session):
     assert "more than one batch" in completed.stdout
     # The whole write rolls back, including the table created by batch 1.
     assert _rows(TARGET_DB, "select to_regclass('transform.keyed_batches')") == [(None,)]
+
+
+def test_duckdb_join_filter_by_matches_fixed_width_character_keys(databases, tmp_path):
+    for database, statements in (
+        (APP_DB, [
+            "create table public.regions (code character(2), name text)",
+            "insert into public.regions values ('AB', 'Alberta'), ('C', 'Short')",
+        ]),
+        (BILLING_DB, [
+            "create table public.region_sales (code character(2), total bigint)",
+            "insert into public.region_sales values ('AB', 10), ('C', 3), ('ZZ', 99)",
+        ]),
+    ):
+        conn = _connect(database)
+        with conn, conn.cursor() as cur:
+            for statement in statements:
+                cur.execute(statement)
+        conn.close()
+    completed = _run_dbt(tmp_path, {
+        "region_totals": """
+def model(dbt, session):
+    dbt.config(materialized="table")
+    regions = dbt.source("app", "regions")
+    sales = dbt.source("billing", "region_sales")
+    return regions.join(sales, on="code", how="left", engine="duckdb", filter_by="left")
+""",
+    }, extra_tables={"app": ["regions"], "billing": ["region_sales"]})
+    assert completed.returncode == 0, completed.stdout + "\n" + completed.stderr
+    assert _rows(
+        TARGET_DB, "select trim(code), name, total from transform.region_totals order by 1"
+    ) == [("AB", "Alberta", 10), ("C", "Short", 3)]

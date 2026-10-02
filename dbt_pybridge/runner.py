@@ -266,6 +266,7 @@ _DUCKDB_TYPES = {
 }
 _PG_JSON_OIDS = {114, 3802}
 _PG_NUMERIC_OID = 1700
+_PG_BPCHAR_OID = 1042
 _DUCKDB_MAX_DECIMAL_PRECISION = 38
 
 
@@ -528,6 +529,10 @@ class FederatedJoinFrame(RelationFrame):
             )
             if name == column
         )
+        if oid == _PG_BPCHAR_OID:
+            # Bare `character` means character(1) and would truncate every key;
+            # bare `bpchar` keeps full length with blank-padded comparison.
+            return "bpchar"
         with frame._session.conn.cursor() as cur:
             cur.execute("select format_type(%s, null)", (oid,))
             return cur.fetchone()[0]
