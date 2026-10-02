@@ -68,7 +68,7 @@ def test_dtype_mapping_interval():
 
 
 def test_dtype_mapping_decimal_object():
-    assert postgres_type_for_series(pd.Series([Decimal("12.34")])) == "numeric(4,2)"
+    assert postgres_type_for_series(pd.Series([Decimal("12.34")])) == "numeric"
 
 
 def test_dtype_mapping_uuid_object():
@@ -130,3 +130,44 @@ def test_dtype_mapping_numpy_object_int64_is_bigint():
 
 def test_dtype_mapping_numpy_object_bool_is_boolean():
     assert postgres_type_for_series(pd.Series([np.bool_(True)], dtype="object")) == "boolean"
+
+
+def test_object_type_inference_checks_every_value():
+    # A sample of the first values used to pick bigint here, and COPY then
+    # failed on the trailing string after the table was created.
+    values = [1] * 500 + ["not a number"]
+    assert postgres_type_for_series(pd.Series(values, dtype=object)) == "text"
+
+
+def test_decimal_columns_are_not_narrowed_to_the_first_batch():
+    first_batch = pd.Series([Decimal("1.5")] * 200, dtype=object)
+    assert postgres_type_for_series(first_batch) == "numeric"
+
+
+@pytest.mark.parametrize("strategy", ["merge", "delete+insert"])
+def test_first_incremental_run_rejects_duplicate_unique_keys(strategy):
+    from dbt_pybridge.dataframe_io import _apply_incremental_chunk
+    from dbt_pybridge.session import TargetRelation
+
+    class NoTableCursor:
+        # The target does not exist yet: the column lookup finds nothing.
+        def execute(self, query, *args, **kwargs):
+            if "create" in query.lower():
+                raise AssertionError("must fail before creating the table")
+
+        def fetchall(self):
+            return []
+
+        def fetchone(self):
+            return None
+
+    df = pd.DataFrame({"id": [1, 1, None, None], "v": ["a", "b", "c", "d"]})
+
+    with pytest.raises(RuntimeError, match="2 rows for unique_key"):
+        _apply_incremental_chunk(
+            NoTableCursor(),
+            TargetRelation(database="d", schema="s", identifier="t"),
+            df,
+            incremental_strategy=strategy,
+            unique_key=["id"],
+        )

@@ -1,11 +1,26 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import math
+import os
+import re
+import tempfile
 from collections.abc import Mapping
+from contextlib import closing
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
+import pandas as pd
+
 from dbt_pybridge.dataframe_io import write_model_result
-from dbt_pybridge.session import LocalPostgresSession, ModelLimits, TargetRelation, quote_ident
+from dbt_pybridge.session import (
+    LocalPostgresSession,
+    ModelLimits,
+    PostgresSessionRegistry,
+    TargetRelation,
+    quote_ident,
+)
 
 
 class RelationFrame:
@@ -42,11 +57,45 @@ class RelationFrame:
         relation_sql = f"(select * from {self._relation_sql} where {predicate}) as pybridge_where"
         return RelationFrame(self._session, relation_sql)
 
-    def join(self, other: "RelationFrame", on=None, how: str = "inner"):
+    def join(
+        self,
+        other: "RelationFrame",
+        on=None,
+        how: str = "inner",
+        engine: Optional[str] = None,
+        memory_limit: str = "512MB",
+        threads: Optional[int] = None,
+        temp_dir: Optional[str] = None,
+        max_temp_directory_size: Optional[str] = None,
+        filter_by: Optional[str] = None,
+    ):
         if not isinstance(other, RelationFrame):
             raise RuntimeError("dbt.ref(...).join(other, ...) requires another RelationFrame; pass dbt.ref('...')")
         if self._session is not other._session:
-            raise RuntimeError("dbt.ref(...).join(...) requires both refs to share a session")
+            if engine == "duckdb":
+                return FederatedJoinFrame(
+                    self,
+                    other,
+                    on=on,
+                    how=how,
+                    memory_limit=memory_limit,
+                    threads=threads,
+                    temp_dir=temp_dir,
+                    max_temp_directory_size=max_temp_directory_size,
+                    filter_by=filter_by,
+                )
+            left_name = getattr(self._session, "connection_name", "unknown")
+            right_name = getattr(other._session, "connection_name", "unknown")
+            raise RuntimeError(
+                "Cannot push down a join across PyBridge connections "
+                f"{left_name!r} and {right_name!r}. Load each side explicitly with "
+                ".as_dataframe(), then join locally with Polars or pandas, or pass "
+                "engine='duckdb' for an explicit spill-backed join."
+            )
+        if engine not in (None, "postgres"):
+            raise RuntimeError(
+                "The DuckDB join engine is only used for cross-connection joins"
+            )
         how_normalized = str(how or "").strip().lower()
         valid_join_types = {"inner", "left", "right", "full", "full outer", "left outer", "right outer", "cross"}
         if how_normalized not in valid_join_types:
@@ -121,6 +170,525 @@ class RelationFrame:
         return self._load()
 
 
+_PLAIN_COLUMN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
+
+
+def consistent_cut(*inputs, lag=None, log=print):
+    """Filter every input to one shared watermark, for consistency across servers.
+
+    Pass ``(relation_frame, column)`` pairs whose column only grows (an
+    ``updated_at`` or ``created_at`` timestamp, or a sequence id). Inside the
+    snapshots pinned at model start, the watermark is the smallest of the
+    per-input maximums, minus ``lag``; each input keeps only rows with
+    ``column <= watermark``. Rows past the slowest source are excluded
+    everywhere, so the inputs describe the same moment. Use ``lag`` to cover
+    transactions that stamp a value before they commit.
+
+    Returns the filtered frames in input order.
+    """
+    if not inputs:
+        raise RuntimeError("consistent_cut() needs at least one (relation, column) pair")
+    pairs = []
+    for item in inputs:
+        try:
+            frame, column = item
+        except (TypeError, ValueError):
+            raise RuntimeError(
+                "consistent_cut() takes (relation, column) pairs, for example "
+                "consistent_cut((dbt.source('app', 'customers'), 'updated_at'), ...)"
+            ) from None
+        if not isinstance(frame, RelationFrame) or isinstance(frame, FederatedJoinFrame):
+            raise RuntimeError(
+                "consistent_cut() needs relations from dbt.ref()/dbt.source(); "
+                "apply it before a DuckDB join"
+            )
+        column = str(column)
+        if not _PLAIN_COLUMN_RE.fullmatch(column):
+            raise RuntimeError(f"consistent_cut() column must be a plain column name, got {column!r}")
+        pairs.append((frame, column))
+
+    maximums = []
+    for frame, column in pairs:
+        with frame._session.conn.cursor() as cur:
+            cur.execute(f"select max({quote_ident(column)}) from {frame._relation_sql}")
+            maximums.append(cur.fetchone()[0])
+    present = [value for value in maximums if value is not None]
+    if not present:
+        log("[pybridge] consistent_cut: every input is empty; nothing to filter")
+        return tuple(frame for frame, _ in pairs)
+    watermark = min(present)
+    if lag is not None:
+        watermark = watermark - lag
+    log(f"[pybridge] consistent_cut watermark {watermark!r} (per-input maximums {maximums!r})")
+
+    filtered = []
+    for frame, column in pairs:
+        with frame._session.conn.cursor() as cur:
+            literal = cur.mogrify("%s", (watermark,)).decode()
+        filtered.append(
+            RelationFrame(
+                frame._session,
+                f"(select * from {frame._relation_sql} "
+                f"where {quote_ident(column)} <= {literal}) as pybridge_cut",
+            )
+        )
+    return tuple(filtered)
+
+
+# Postgres type OID -> DuckDB staging type. Staging tables are created from
+# these up front: inferring types from the first batch silently rounds
+# numerics (1.55 -> 2 after a batch of whole numbers) and rejects later
+# values when the first batch is all NULL.
+_DUCKDB_TYPES = {
+    16: "BOOLEAN",
+    17: "BLOB",
+    19: "VARCHAR",
+    20: "BIGINT",
+    21: "SMALLINT",
+    23: "INTEGER",
+    25: "VARCHAR",
+    700: "REAL",
+    701: "DOUBLE",
+    1007: "INTEGER[]",
+    1009: "VARCHAR[]",
+    1015: "VARCHAR[]",
+    1016: "BIGINT[]",
+    1021: "REAL[]",
+    1022: "DOUBLE[]",
+    1042: "VARCHAR",
+    1043: "VARCHAR",
+    1082: "DATE",
+    1083: "TIME",
+    1114: "TIMESTAMP",
+    1184: "TIMESTAMPTZ",
+    1186: "INTERVAL",
+    2950: "UUID",
+}
+_PG_JSON_OIDS = {114, 3802}
+_PG_NUMERIC_OID = 1700
+_PG_BPCHAR_OID = 1042
+_DUCKDB_MAX_DECIMAL_PRECISION = 38
+
+
+def _encode_json(value):
+    return json.dumps(value)
+
+
+def _encode_bytes(value):
+    return bytes(value)
+
+
+def _decode_decimal(value):
+    return Decimal(value)
+
+
+class _StagedColumn:
+    """How one Postgres column is staged in DuckDB and restored afterwards."""
+
+    def __init__(self, name, type_oid, precision, scale):
+        self.name = name
+        self.encode = None
+        self.decode = None
+        self.text_passthrough = False
+        self.read_as_text = False
+        if type_oid == _PG_NUMERIC_OID:
+            if precision and 0 < precision <= _DUCKDB_MAX_DECIMAL_PRECISION:
+                # Join on real DECIMALs, but read results back as text:
+                # DuckDB hands DECIMAL to pandas as float64.
+                self.duckdb_type = f"DECIMAL({precision},{scale or 0})"
+                self.decode = _decode_decimal
+                self.read_as_text = True
+            else:
+                # Unconstrained numeric does not fit DuckDB's DECIMAL(38).
+                # Carry exact text through the join and restore Decimals.
+                self.duckdb_type = "VARCHAR"
+                self.encode = str
+                self.decode = _decode_decimal
+                self.text_passthrough = True
+        elif type_oid in _PG_JSON_OIDS:
+            self.duckdb_type = "VARCHAR"
+            self.encode = _encode_json
+            self.decode = json.loads
+            self.text_passthrough = True
+        elif type_oid in _DUCKDB_TYPES:
+            self.duckdb_type = _DUCKDB_TYPES[type_oid]
+            if type_oid == 17:
+                self.encode = _encode_bytes
+        else:
+            raise RuntimeError(
+                f"Column {name!r} has Postgres type OID {type_oid}, which the DuckDB "
+                "federated join does not stage. Cast it in .select(), for example "
+                f"'{name}::text'."
+            )
+
+
+def _is_missing(value) -> bool:
+    # DuckDB returns NULL text as NaN in pandas chunks.
+    return value is None or (isinstance(value, float) and math.isnan(value))
+
+
+def _map_non_null(series, fn):
+    return series.map(lambda value: None if _is_missing(value) else fn(value)).astype(object)
+
+
+class FederatedJoinFrame(RelationFrame):
+    """Explicit cross-connection join staged in a temporary DuckDB database."""
+
+    _SIZE_RE = re.compile(r"^[1-9][0-9]*(?:KB|MB|GB|TB)$", re.IGNORECASE)
+
+    def __init__(
+        self,
+        left,
+        right,
+        on,
+        how,
+        memory_limit,
+        threads=None,
+        temp_dir=None,
+        max_temp_directory_size=None,
+        filter_by=None,
+    ):
+        if isinstance(on, str):
+            keys = [on]
+        elif on is None:
+            keys = []
+        else:
+            try:
+                keys = list(on)
+            except TypeError:
+                raise RuntimeError(
+                    f"Invalid `on=` value {on!r}; expected a column name or list of names"
+                ) from None
+        self._keys = [str(key).strip() for key in keys if str(key).strip()]
+        self._how = str(how or "").strip().lower()
+        valid = {"inner", "left", "right", "full", "full outer", "left outer", "right outer", "cross"}
+        if self._how not in valid:
+            raise RuntimeError(
+                f"Invalid join type {how!r}. Expected one of: {sorted(valid)}"
+            )
+        if self._how == "cross":
+            if self._keys:
+                raise RuntimeError("Cross joins do not take an `on=` argument")
+        elif not self._keys:
+            raise RuntimeError(
+                "A DuckDB federated join requires `on=` to be a column name or list of names"
+            )
+        for key in self._keys:
+            if ";" in key or '"' in key:
+                raise RuntimeError(f"Invalid join key {key!r}")
+        self._memory_limit = self._validated_size("memory_limit", memory_limit)
+        self._max_temp_directory_size = (
+            None
+            if max_temp_directory_size is None
+            else self._validated_size("max_temp_directory_size", max_temp_directory_size)
+        )
+        if threads is not None and (
+            isinstance(threads, bool) or not isinstance(threads, int) or threads <= 0
+        ):
+            raise RuntimeError(f"DuckDB threads must be a positive integer, got {threads!r}")
+        self._threads = threads
+        self._temp_dir = None if temp_dir is None else str(temp_dir)
+        self._filter_by = self._validated_filter_by(filter_by)
+        self._left = left
+        self._right = right
+        self._backend = getattr(left._session, "dataframe_backend", "pandas")
+        self._limits = getattr(left._session, "limits", None) or ModelLimits()
+        self._df = None
+
+    # filter_by=<side> stages that side first and fetches only the other
+    # side's rows whose key it contains. That is only correct when the other
+    # side's unmatched rows would be dropped by the join anyway.
+    _FILTER_SAFE_JOINS = {
+        "left": {"inner", "left", "left outer"},
+        "right": {"inner", "right", "right outer"},
+    }
+    _KEY_FILTER_CHUNK = 10_000
+
+    def _validated_filter_by(self, filter_by):
+        if filter_by is None:
+            return None
+        side = str(filter_by).strip().lower()
+        if side not in self._FILTER_SAFE_JOINS:
+            raise RuntimeError(f"filter_by must be 'left' or 'right', got {filter_by!r}")
+        if self._how not in self._FILTER_SAFE_JOINS[side]:
+            raise RuntimeError(
+                f"filter_by={side!r} would drop rows a {self._how!r} join keeps; it works "
+                f"with {sorted(self._FILTER_SAFE_JOINS[side])} joins"
+            )
+        if len(self._keys) != 1:
+            raise RuntimeError("filter_by supports a single join key")
+        return side
+
+    @classmethod
+    def _validated_size(cls, label, value):
+        text = str(value).strip()
+        if not cls._SIZE_RE.fullmatch(text):
+            raise RuntimeError(
+                f"DuckDB {label} must look like '512MB', '2GB', or another positive size"
+            )
+        return text.upper()
+
+    @staticmethod
+    def _duckdb_module():
+        try:
+            import duckdb
+        except ImportError:
+            raise RuntimeError(
+                "DuckDB federation is optional. Install it with "
+                "`pip install 'dbt-pybridge[federation]'`."
+            ) from None
+        return duckdb
+
+    @staticmethod
+    def _staged_columns(frame: RelationFrame):
+        columns = frame._session.relation_columns(frame._relation_sql)
+        return [_StagedColumn(*column) for column in columns]
+
+    def _validate_columns(self, left_columns, right_columns):
+        left_names = [column.name for column in left_columns]
+        right_names = [column.name for column in right_columns]
+        for side, names in (("left", left_names), ("right", right_names)):
+            missing = [key for key in self._keys if key not in names]
+            if missing:
+                raise RuntimeError(
+                    f"Join key(s) {missing} are missing from the {side} side; "
+                    f"its columns are {names}"
+                )
+        overlap = sorted((set(left_names) & set(right_names)) - set(self._keys))
+        if overlap:
+            raise RuntimeError(
+                f"Columns {overlap} exist on both sides of the DuckDB join. "
+                "Rename or drop them in .select() before joining."
+            )
+        for column in left_columns + right_columns:
+            if column.name in self._keys and column.text_passthrough:
+                raise RuntimeError(
+                    f"Join key {column.name!r} is unconstrained numeric or JSON, which is "
+                    "staged as text and would compare by spelling. Cast it in .select(), "
+                    f"for example '{column.name}::bigint'."
+                )
+
+    @staticmethod
+    def _stage_frame(conn, table_name: str, frame: RelationFrame, columns, create=True) -> None:
+        table = quote_ident(table_name)
+        if create:
+            column_ddl = ", ".join(
+                f"{quote_ident(column.name)} {column.duckdb_type}" for column in columns
+            )
+            conn.execute(f"create table {table} ({column_ddl})")
+        column_list = ", ".join(quote_ident(column.name) for column in columns)
+        batches = frame._session.iter_relation_batches(frame._relation_sql, as_pandas=True)
+        for batch in batches:
+            batch = batch.copy()
+            for column in columns:
+                if column.encode is not None:
+                    batch[column.name] = _map_non_null(batch[column.name], column.encode)
+            conn.register("pybridge_batch", batch)
+            try:
+                # Explicit columns cast each batch into the declared types.
+                conn.execute(
+                    f"insert into {table} ({column_list}) "
+                    f"select {column_list} from pybridge_batch"
+                )
+            finally:
+                conn.unregister("pybridge_batch")
+
+    def _stage_frame_by_keys(self, conn, table_name, frame, columns, key_table):
+        """Stage `frame`, fetching only rows whose key exists in `key_table`."""
+        column_ddl = ", ".join(
+            f"{quote_ident(column.name)} {column.duckdb_type}" for column in columns
+        )
+        conn.execute(f"create table {quote_ident(table_name)} ({column_ddl})")
+        key = quote_ident(self._keys[0])
+        key_type = self._postgres_type_name(frame, self._keys[0])
+        # Keys travel as text and are cast back to the source column's type
+        # in Postgres, so the filter can still use an index on that column.
+        keys_cursor = conn.cursor().execute(
+            f"select distinct cast({key} as varchar) from {quote_ident(key_table)} "
+            f"where {key} is not null"
+        )
+        while True:
+            chunk = [row[0] for row in keys_cursor.fetchmany(self._KEY_FILTER_CHUNK)]
+            if not chunk:
+                break
+            with frame._session.conn.cursor() as cur:
+                keys_literal = cur.mogrify("%s::text[]", (chunk,)).decode()
+            filtered = RelationFrame(
+                frame._session,
+                f"(select * from {frame._relation_sql} where {key} = "
+                f"any(cast({keys_literal} as {key_type}[]))) as pybridge_key_filter",
+            )
+            self._stage_frame(conn, table_name, filtered, columns, create=False)
+
+    @staticmethod
+    def _postgres_type_name(frame, column):
+        oid = next(
+            type_oid
+            for name, type_oid, _precision, _scale in frame._session.relation_columns(
+                frame._relation_sql
+            )
+            if name == column
+        )
+        if oid == _PG_BPCHAR_OID:
+            # Bare `character` means character(1) and would truncate every key;
+            # bare `bpchar` keeps full length with blank-padded comparison.
+            return "bpchar"
+        with frame._session.conn.cursor() as cur:
+            cur.execute("select format_type(%s, null)", (oid,))
+            return cur.fetchone()[0]
+
+    def _open_query(self):
+        duckdb = self._duckdb_module()
+        left_columns = self._staged_columns(self._left)
+        right_columns = self._staged_columns(self._right)
+        self._validate_columns(left_columns, right_columns)
+        tempdir = tempfile.TemporaryDirectory(
+            prefix="dbt_pybridge_duckdb_", dir=self._temp_dir
+        )
+        database_path = os.path.join(tempdir.name, "federation.duckdb")
+        conn = duckdb.connect(database_path)
+        try:
+            escaped_tempdir = tempdir.name.replace("'", "''")
+            conn.execute(f"set temp_directory='{escaped_tempdir}'")
+            conn.execute(f"set memory_limit='{self._memory_limit}'")
+            conn.execute("set preserve_insertion_order=false")
+            if self._threads is not None:
+                conn.execute(f"set threads={int(self._threads)}")
+            if self._max_temp_directory_size is not None:
+                conn.execute(
+                    f"set max_temp_directory_size='{self._max_temp_directory_size}'"
+                )
+            # Stage both sides only after their snapshots were pinned at
+            # model start (see PostgresSessionRegistry.pin_snapshots).
+            if self._filter_by == "left":
+                self._stage_frame(conn, "pybridge_left", self._left, left_columns)
+                self._stage_frame_by_keys(
+                    conn, "pybridge_right", self._right, right_columns, "pybridge_left"
+                )
+            elif self._filter_by == "right":
+                self._stage_frame(conn, "pybridge_right", self._right, right_columns)
+                self._stage_frame_by_keys(
+                    conn, "pybridge_left", self._left, left_columns, "pybridge_right"
+                )
+            else:
+                self._stage_frame(conn, "pybridge_left", self._left, left_columns)
+                self._stage_frame(conn, "pybridge_right", self._right, right_columns)
+            left = quote_ident("pybridge_left")
+            right = quote_ident("pybridge_right")
+            by_name = {column.name: column for column in right_columns}
+            by_name.update({column.name: column for column in left_columns})
+            ordered = self._keys + [
+                column.name
+                for column in left_columns + right_columns
+                if column.name not in self._keys
+            ]
+            select_list = ", ".join(
+                f"cast({quote_ident(name)} as varchar) as {quote_ident(name)}"
+                if by_name[name].read_as_text
+                else quote_ident(name)
+                for name in ordered
+            )
+            if self._how == "cross":
+                query = f"select {select_list} from {left} cross join {right}"
+            else:
+                keys = ", ".join(quote_ident(key) for key in self._keys)
+                query = (
+                    f"select {select_list} from {left} {self._how} join {right} "
+                    f"using ({keys})"
+                )
+            cursor = conn.execute(query)
+            decoders = {
+                column.name: column.decode
+                for column in left_columns + right_columns
+                if column.decode is not None
+            }
+            return tempdir, conn, cursor, decoders
+        except BaseException:
+            conn.close()
+            tempdir.cleanup()
+            raise
+
+    def _iter_result_frames(self, chunk_size: int):
+        tempdir, conn, cursor, decoders = self._open_query()
+        try:
+            self._result_columns = [column[0] for column in cursor.description]
+            buffered = []
+            buffered_rows = 0
+            while True:
+                # DuckDB hands out fixed-size vectors; regroup them into
+                # chunk_size frames, concatenating each batch only once.
+                chunk = cursor.fetch_df_chunk()
+                exhausted = len(chunk) == 0
+                if not exhausted:
+                    buffered.append(chunk)
+                    buffered_rows += len(chunk)
+                while buffered_rows >= chunk_size or (exhausted and buffered_rows):
+                    pending = pd.concat(buffered, ignore_index=True)
+                    frame = pending.iloc[:chunk_size].reset_index(drop=True)
+                    rest = pending.iloc[chunk_size:].reset_index(drop=True)
+                    buffered = [rest] if len(rest) else []
+                    buffered_rows = len(rest)
+                    for name, decode in decoders.items():
+                        frame[name] = _map_non_null(frame[name], decode)
+                    yield frame
+                if exhausted:
+                    break
+        finally:
+            conn.close()
+            tempdir.cleanup()
+
+    def _to_backend(self, frame):
+        if self._backend == "polars":
+            import polars as pl
+            return pl.from_pandas(frame)
+        return frame
+
+    def _load(self):
+        if self._df is None:
+            limits = self._limits
+            frames = []
+            rows = 0
+            byte_count = 0
+            result_frames = self._iter_result_frames(limits.batch_size)
+            with closing(result_frames):
+                for frame in result_frames:
+                    rows += len(frame)
+                    byte_count += int(frame.memory_usage(index=True, deep=True).sum())
+                    if not limits.allow_large_tables and rows > limits.max_rows:
+                        raise RuntimeError(
+                            f"DuckDB federated join returned more than {limits.max_rows:,} rows. "
+                            "Return joined.iter_batches() to stream it, or raise pybridge_max_rows."
+                        )
+                    if not limits.allow_large_tables and byte_count > limits.max_bytes:
+                        raise RuntimeError(
+                            f"DuckDB federated join result exceeded {limits.max_bytes:,} bytes. "
+                            "Return joined.iter_batches() to stream it, or raise pybridge_max_bytes."
+                        )
+                    frames.append(frame)
+            if frames:
+                df = pd.concat(frames, ignore_index=True)
+            else:
+                df = pd.DataFrame(columns=self._result_columns)
+            self._df = self._to_backend(df)
+        return self._df
+
+    def iter_batches(self, batch_size: Optional[int] = None):
+        chunk_size = int(batch_size or self._limits.batch_size)
+        if chunk_size <= 0:
+            raise RuntimeError(f"Batch size must be > 0, got {chunk_size}")
+        for frame in self._iter_result_frames(chunk_size):
+            yield self._to_backend(frame)
+
+    def select(self, projection_sql: str):
+        raise RuntimeError("Apply select() before a DuckDB federated join")
+
+    def where(self, predicate_sql: str):
+        raise RuntimeError("Apply where() before a DuckDB federated join")
+
+    def join(self, other, on=None, how="inner", engine=None, **_kwargs):
+        raise RuntimeError("Chain additional joins after materializing the federated result")
+
+
 class LocalPythonModelRunner:
     def __init__(self, credentials, parsed_model: Dict[str, Any], compiled_code: str) -> None:
         self.credentials = credentials
@@ -145,14 +713,24 @@ class LocalPythonModelRunner:
         print(f"[pybridge] {message}")
 
     @staticmethod
-    def _load_df_function(session: LocalPostgresSession):
+    def _load_df_function(session_or_registry):
         # The callback dbt's compiled `dbtObj` calls for each `dbt.ref(...)` /
         # `dbt.source(...)`. We normalize the 3-part identifier dbt renders
         # ("db"."schema"."t") down to a 2-part one *here*, at the single entry
         # point, so every subsequent .select()/.where()/.join() wraps an
         # already-safe relation SQL and can't smuggle a cross-database
         # qualifier into the resulting subquery.
-        def load(relation_sql: str) -> "RelationFrame":
+        def load(relation_sql: str, connection_name: Optional[str] = None) -> "RelationFrame":
+            if isinstance(session_or_registry, PostgresSessionRegistry):
+                session = session_or_registry.get(connection_name)
+            else:
+                # Backwards-compatible path for callers using this helper
+                # directly with a single LocalPostgresSession.
+                if connection_name:
+                    raise RuntimeError(
+                        "A named PyBridge connection requires a PostgresSessionRegistry"
+                    )
+                session = session_or_registry
             return RelationFrame(session, session._normalize_relation_sql(relation_sql))
         return load
 
@@ -185,12 +763,22 @@ class LocalPythonModelRunner:
                 f"Invalid value for {key}: expected boolean-like value, got {value!r}"
             )
 
+        batch_size = _as_int("pybridge_batch_size", 100_000)
+        if batch_size <= 0:
+            raise RuntimeError(
+                f"Invalid value for pybridge_batch_size: expected > 0, got {batch_size}"
+            )
+
         return ModelLimits(
             max_rows=_as_int("pybridge_max_rows", 1_000_000),
             warn_rows=_as_int("pybridge_warn_rows", 200_000),
             max_bytes=_as_int("pybridge_max_bytes", 512 * 1024 * 1024),
             warn_bytes=_as_int("pybridge_warn_bytes", 128 * 1024 * 1024),
-            batch_size=_as_int("pybridge_batch_size", 100_000),
+            max_total_rows=_as_int("pybridge_max_total_rows", 1_000_000),
+            warn_total_rows=_as_int("pybridge_warn_total_rows", 200_000),
+            max_total_bytes=_as_int("pybridge_max_total_bytes", 512 * 1024 * 1024),
+            warn_total_bytes=_as_int("pybridge_warn_total_bytes", 128 * 1024 * 1024),
+            batch_size=batch_size,
             allow_large_tables=_as_bool("pybridge_allow_large_tables", False),
             chunked_mode=_as_bool("pybridge_chunked_mode", False),
         )
@@ -222,8 +810,15 @@ class LocalPythonModelRunner:
         return out
 
     def _target_relation(self) -> TargetRelation:
+        model_database = self.parsed_model.get("database")
+        target_database = getattr(self.credentials, "database", None)
+        if model_database and target_database and str(model_database) != str(target_database):
+            raise RuntimeError(
+                "Python model target database does not match the active PyBridge target: "
+                f"model={model_database!r}, target={target_database!r}"
+            )
         return TargetRelation(
-            database=self.parsed_model.get("database"),
+            database=model_database,
             schema=self.parsed_model.get("schema"),
             identifier=self.parsed_model.get("alias") or self.parsed_model.get("name"),
         )
@@ -442,16 +1037,24 @@ class LocalPythonModelRunner:
         if incremental_strategy == "default":
             incremental_strategy = "merge" if unique_key else "append"
 
-        session = LocalPostgresSession(
-            credentials=self.credentials,
+        registry = PostgresSessionRegistry(
+            target_credentials=self.credentials,
+            named_connections=getattr(self.credentials, "pybridge_connections", None),
             limits=limits,
             dataframe_backend=dataframe_backend,
             logger=self._log,
+            session_factory=LocalPostgresSession,
+            target_isolation=self._cfg_value(
+                cfg, "pybridge_target_isolation", None, "repeatable read"
+            ),
         )
+        session = registry.get()
+        primary_error: Optional[BaseException] = None
 
         try:
             namespace: Dict[str, Any] = {}
             exec(self.compiled_code, namespace)
+            registry.pin_snapshots(namespace.get("__pybridge_source_connections__") or [])
 
             model_fn = namespace.get("model")
             if model_fn is None:
@@ -463,7 +1066,7 @@ class LocalPythonModelRunner:
             if dbt_obj_cls is None:
                 raise RuntimeError("Compiled Python model is missing dbtObj from dbt py_script_postfix")
 
-            dbt_obj = dbt_obj_cls(self._load_df_function(session))
+            dbt_obj = dbt_obj_cls(self._load_df_function(registry))
             model_result = model_fn(dbt_obj, session)
             if isinstance(model_result, RelationFrame):
                 model_result = model_result.as_dataframe()
@@ -506,5 +1109,16 @@ class LocalPythonModelRunner:
                 on_schema_change=on_schema_change,
                 cascade_drops=sync_drop_cascade,
             )
+        except BaseException as exc:
+            primary_error = exc
+            raise
         finally:
-            session.close()
+            try:
+                registry.close()
+            except Exception as close_error:
+                if primary_error is None:
+                    raise
+                self._log(
+                    "Connection cleanup also failed after the model error: "
+                    f"{type(close_error).__name__}: {close_error}"
+                )

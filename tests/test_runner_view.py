@@ -22,7 +22,7 @@ def test_runner_view_materialization_routes_through_swap(monkeypatch):
     with the right view target and the deterministic backing target."""
 
     class FakeSession:
-        def __init__(self, credentials, limits, dataframe_backend, logger=None):
+        def __init__(self, credentials, limits, dataframe_backend, logger=None, connection_name="target", usage_tracker=None, target_isolation="repeatable read"):
             self.conn = object()
 
         def close(self):
@@ -83,6 +83,129 @@ def model(dbt, session):
     # with materialized='table' and the intermediate identifier we passed.
     assert captured["write_materialized"] == "table"
     assert captured["write_target"] is captured["backing_target"]
+
+
+def test_runner_reads_two_named_connections_and_writes_to_target(monkeypatch):
+    created = []
+
+    class FakeSession:
+        def __init__(self, credentials, limits, dataframe_backend, logger=None, connection_name="target", usage_tracker=None, target_isolation="repeatable read"):
+            self.credentials = credentials
+            self.connection_name = connection_name
+            self.conn = object()
+            self.closed = False
+            created.append(self)
+
+        def _normalize_relation_sql(self, relation_sql):
+            return ".".join(relation_sql.split(".")[-2:])
+
+        def load_relation(self, relation_sql):
+            if self.connection_name == "app_db":
+                return pd.DataFrame({"customer_id": [1, 2], "name": ["Ada", "Lin"]})
+            if self.connection_name == "billing_db":
+                return pd.DataFrame({"customer_id": [1, 2], "amount": [10, 20]})
+            raise AssertionError("The target session must not be used for source reads")
+
+        def close(self):
+            self.closed = True
+
+    captured = {}
+
+    def fake_write_model_result(conn, target, result, **kwargs):
+        captured["conn"] = conn
+        captured["result"] = result
+        return len(result)
+
+    monkeypatch.setattr(runner_module, "LocalPostgresSession", FakeSession)
+    monkeypatch.setattr(runner_module, "write_model_result", fake_write_model_result)
+
+    compiled_code = '''
+class dbtObj:
+    def __init__(self, load_df_function):
+        self.source = lambda source_name, table_name: load_df_function(
+            f'"{source_name}"."public"."{table_name}"',
+            connection_name=f"{source_name}_db",
+        )
+        self.ref = lambda *args, **kwargs: None
+        self.config = type("config", (), {"get": staticmethod(lambda k, d=None: d)})
+        self.this = None
+        self.is_incremental = False
+
+def model(dbt, session):
+    customers = dbt.source("app", "customers").as_dataframe()
+    orders = dbt.source("billing", "orders").as_dataframe()
+    return customers.merge(orders, on="customer_id", how="left")
+'''
+
+    credentials = type(
+        "Credentials",
+        (),
+        {
+            "database": "analytics",
+            "pybridge_connections": {
+                "app_db": {
+                    "host": "app.example.invalid",
+                    "user": "reader",
+                    "password": "secret",
+                    "database": "app",
+                },
+                "billing_db": {
+                    "host": "billing.example.invalid",
+                    "user": "reader",
+                    "password": "secret",
+                    "database": "billing",
+                },
+            },
+        },
+    )()
+    runner = LocalPythonModelRunner(
+        credentials=credentials,
+        parsed_model={
+            "database": "analytics",
+            "schema": "transform",
+            "name": "customer_orders",
+            "config": {"materialized": "table"},
+        },
+        compiled_code=compiled_code,
+    )
+
+    assert runner.run() == 2
+    assert [session.connection_name for session in created] == [
+        "target", "app_db", "billing_db"
+    ]
+    assert captured["conn"] is created[0].conn
+    assert list(captured["result"].columns) == ["customer_id", "name", "amount"]
+    assert all(session.closed for session in created)
+
+
+def test_runner_preserves_model_error_when_cleanup_also_fails(monkeypatch, capsys):
+    class CloseFailSession:
+        def __init__(self, credentials, limits, dataframe_backend, logger=None, connection_name="target", usage_tracker=None, target_isolation="repeatable read"):
+            self.conn = object()
+
+        def close(self):
+            raise RuntimeError("synthetic close failure")
+
+    monkeypatch.setattr(runner_module, "LocalPostgresSession", CloseFailSession)
+
+    compiled_code = '''
+class dbtObj:
+    def __init__(self, load_df_function):
+        self.config = type("config", (), {"get": staticmethod(lambda k, d=None: d)})
+
+def model(dbt, session):
+    raise ValueError("synthetic model failure")
+'''
+    runner = LocalPythonModelRunner(
+        credentials=object(),
+        parsed_model={"name": "broken", "config": {"materialized": "table"}},
+        compiled_code=compiled_code,
+    )
+
+    with pytest.raises(ValueError, match="synthetic model failure"):
+        runner.run()
+
+    assert "cleanup also failed" in capsys.readouterr().out
 
 
 def test_materialize_view_via_swap_rename_swap_order(monkeypatch):

@@ -9,6 +9,24 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PYBRIDGE_INTEGRATION_HOST: 127.0.0.1
+      PYBRIDGE_INTEGRATION_PORT: "5432"
+      PYBRIDGE_INTEGRATION_USER: postgres
+      PYBRIDGE_INTEGRATION_PASSWORD: postgres
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,7 +38,9 @@ jobs:
 
       - name: Build package
         run: |
-          python -m pip install --upgrade pip build
+          python -m pip install --upgrade pip build pytest
+          python -m pip install -e ".[federation]"
+          pytest -q
           python -m build
 
       - name: Upload dist artifacts

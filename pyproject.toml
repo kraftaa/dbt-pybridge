@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dbt-pybridge"
-version = "0.2.3"
+version = "0.3.0"
 description = "Run dbt Python models locally and materialize results back to Postgres"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -20,6 +20,9 @@ dependencies = [
 examples = [
   "scikit-learn>=1.4,<2",
 ]
+federation = [
+  "duckdb>=1.1,<2",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]
@@ -32,3 +35,6 @@ dbt_pybridge = ["dbt_project.yml", "macros/**/*.sql"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+  "integration: requires explicitly configured synthetic Postgres databases",
+]
