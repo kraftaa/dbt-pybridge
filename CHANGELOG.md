@@ -24,8 +24,8 @@
   an all-NULL batch), return exact `Decimal` values, apply `pybridge_max_rows`
   and `pybridge_max_bytes` to eager join results, reject clashing non-key
   column names, and accept `threads`, `temp_dir`, and `max_temp_directory_size`.
-- Reject incremental `merge`/`delete+insert` batches that contain one
-  `unique_key` more than once.
+- Reject incremental `merge`/`delete+insert` results that contain one
+  `unique_key` more than once, within a batch or across yielded batches.
 - Allow client-certificate, Kerberos/GSSAPI, `~/.pgpass`, and trust
   authentication for named connections; add `sslpassword`, `gssencmode`, and
   `krbsrvname`.

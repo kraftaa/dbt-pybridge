@@ -349,3 +349,24 @@ def model(dbt, session):
     assert completed.returncode != 0
     assert "rows for unique_key" in completed.stdout
     assert _rows(TARGET_DB, "select to_regclass('transform.keyed_first')") == [(None,)]
+
+
+def test_incremental_merge_rejects_unique_key_repeated_across_batches(databases, tmp_path):
+    completed = _run_dbt(tmp_path, {
+        "keyed_batches": """
+def model(dbt, session):
+    import pandas as pd
+
+    dbt.config(materialized="incremental", unique_key="id", incremental_strategy="merge")
+
+    def batches():
+        yield pd.DataFrame({"id": [1], "v": ["first"]})
+        yield pd.DataFrame({"id": [1], "v": ["second"]})
+
+    return batches()
+""",
+    })
+    assert completed.returncode != 0
+    assert "more than one batch" in completed.stdout
+    # The whole write rolls back, including the table created by batch 1.
+    assert _rows(TARGET_DB, "select to_regclass('transform.keyed_batches')") == [(None,)]

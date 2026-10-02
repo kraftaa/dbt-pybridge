@@ -11,6 +11,8 @@ import re
 import uuid
 from typing import Callable, Dict, Iterable, List, Optional, Sequence, Tuple
 
+import psycopg2
+
 from dbt_pybridge.session import TargetRelation, quote_ident
 
 
@@ -748,6 +750,48 @@ def _reject_duplicate_unique_keys_in_frame(df, unique_key: Sequence[str]) -> Non
         )
 
 
+class _UniqueKeyTracker:
+    """Rejects a unique_key that appears in more than one yielded batch.
+
+    Each batch is only checked against itself, so a key yielded twice would
+    otherwise be merged twice and the later row would silently win. Keys go
+    into a uniquely indexed temp table in the write transaction, so memory
+    stays flat for large streams and a repeat aborts the whole write.
+    """
+
+    def __init__(self, unique_key: Sequence[str]) -> None:
+        self._keys = list(unique_key)
+        self._relation: Optional[TargetRelation] = None
+        self._types: Dict[str, str] = {}
+
+    def record(self, cur, target: TargetRelation, chunk_df) -> None:
+        if chunk_df.empty:
+            return
+        if self._relation is None:
+            self._relation = _temp_relation(target)
+            columns_sql = ", ".join(quote_ident(col) for col in self._keys)
+            cur.execute(
+                f"create temporary table {self._relation.render()} on commit drop as "
+                f"select {columns_sql} from {target.render()} limit 0"
+            )
+            cur.execute(f"create unique index on {self._relation.render()} ({columns_sql})")
+            self._types = {
+                name: col_type
+                for name, col_type in _table_columns_with_types(cur, target)
+                if name in self._keys
+            }
+        try:
+            _copy_dataframe(
+                cur, self._relation, chunk_df[self._keys], column_sql_types=self._types
+            )
+        except psycopg2.errors.UniqueViolation:
+            raise RuntimeError(
+                f"Python model output repeats a unique_key {self._keys} in more than one "
+                "batch. Deduplicate across batches before an incremental merge or "
+                "delete+insert."
+            ) from None
+
+
 def _merge_from_temp(cur, target: TargetRelation, temp_sql: str, columns: Sequence[str], unique_key: Sequence[str]) -> None:
     target_sql = target.render()
     update_columns = [col for col in columns if col not in unique_key]
@@ -1029,6 +1073,13 @@ def write_model_result(
         created = False
         expected_columns = None
         expected_types = None
+        key_tracker = (
+            _UniqueKeyTracker(unique_key)
+            if materialized != "table"
+            and incremental_strategy in {"merge", "delete+insert"}
+            and unique_key
+            else None
+        )
         with conn.cursor() as cur:
             for batch_idx, chunk in enumerate(result, start=1):
                 if not (is_pandas_df(chunk) or is_polars_df(chunk)):
@@ -1070,7 +1121,10 @@ def write_model_result(
                         column_types=column_types,
                         categorical_types=categorical_types,
                         on_schema_change=on_schema_change,
+                        cascade_drops=cascade_drops,
                     )
+                    if key_tracker is not None:
+                        key_tracker.record(cur, target, chunk_df)
                     created = True
 
             if not created:
