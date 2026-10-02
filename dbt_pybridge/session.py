@@ -269,11 +269,12 @@ def _run_password_command(command, connection_name: str, timeout: int) -> str:
             f"{type(exc).__name__}"
         ) from None
     if completed.returncode != 0:
-        detail = (completed.stderr or "").strip().splitlines()
+        # Credential helpers may print tokens or secrets on stderr; never
+        # copy it into an error that dbt logs. Run the command by hand to debug.
         raise RuntimeError(
             f"password_command for PyBridge connection {connection_name!r} exited with "
-            f"status {completed.returncode}"
-            + (f": {detail[-1][:200]}" if detail else "")
+            f"status {completed.returncode} (its output is not shown because it may "
+            "contain credentials; run the command directly to see it)"
         )
     token = (completed.stdout or "").strip()
     if not token:

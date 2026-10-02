@@ -572,11 +572,20 @@ def test_password_command_failure_does_not_connect(monkeypatch):
         lambda **kwargs: (_ for _ in ()).throw(AssertionError("must not connect")),
     )
     credentials = _named_with_command(
-        [sys.executable, "-c", "import sys; sys.stderr.write('token expired\\n'); sys.exit(3)"]
+        [
+            sys.executable,
+            "-c",
+            "import sys; print('stdout-secret'); "
+            "sys.stderr.write('credential=example-secret\\n'); sys.exit(3)",
+        ]
     )
 
-    with pytest.raises(RuntimeError, match="status 3: token expired"):
+    with pytest.raises(RuntimeError, match="exited with status 3") as exc:
         LocalPostgresSession(credentials, ModelLimits(), connection_name="app_db")
+
+    # Credential helpers may print secrets; none of their output is surfaced.
+    assert "example-secret" not in str(exc.value)
+    assert "stdout-secret" not in str(exc.value)
 
 
 @pytest.mark.parametrize("command", ["aws rds generate-db-auth-token", [], [""], [1]])
