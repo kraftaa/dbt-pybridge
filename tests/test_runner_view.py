@@ -22,7 +22,7 @@ def test_runner_view_materialization_routes_through_swap(monkeypatch):
     with the right view target and the deterministic backing target."""
 
     class FakeSession:
-        def __init__(self, credentials, limits, dataframe_backend, logger=None, connection_name="target", usage_tracker=None):
+        def __init__(self, credentials, limits, dataframe_backend, logger=None, connection_name="target", usage_tracker=None, target_isolation="repeatable read"):
             self.conn = object()
 
         def close(self):
@@ -89,7 +89,7 @@ def test_runner_reads_two_named_connections_and_writes_to_target(monkeypatch):
     created = []
 
     class FakeSession:
-        def __init__(self, credentials, limits, dataframe_backend, logger=None, connection_name="target", usage_tracker=None):
+        def __init__(self, credentials, limits, dataframe_backend, logger=None, connection_name="target", usage_tracker=None, target_isolation="repeatable read"):
             self.credentials = credentials
             self.connection_name = connection_name
             self.conn = object()
@@ -180,7 +180,7 @@ def model(dbt, session):
 
 def test_runner_preserves_model_error_when_cleanup_also_fails(monkeypatch, capsys):
     class CloseFailSession:
-        def __init__(self, credentials, limits, dataframe_backend, logger=None, connection_name="target", usage_tracker=None):
+        def __init__(self, credentials, limits, dataframe_backend, logger=None, connection_name="target", usage_tracker=None, target_isolation="repeatable read"):
             self.conn = object()
 
         def close(self):

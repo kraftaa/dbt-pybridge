@@ -205,14 +205,51 @@ The eager loader fetches at most `pybridge_max_rows + 1` rows before enforcing
 the row limit, avoiding a separate `count(*)` scan and preventing changes
 between a count query and the actual read from bypassing the guardrail.
 
+## Align sources with a consistent cut
+
+Separate servers cannot share one snapshot, and replicas or loaders may lag
+each other. If each source has a column that only grows (`updated_at`,
+`created_at`, or a sequence id), `consistent_cut` filters every input to the
+same moment:
+
+```python
+from datetime import timedelta
+from dbt_pybridge import consistent_cut
+
+
+def model(dbt, session):
+    customers = dbt.source("app", "customers")
+    payments = dbt.source("billing", "payments")
+    customers, payments = consistent_cut(
+        (customers, "updated_at"),
+        (payments, "paid_at"),
+        lag=timedelta(minutes=5),
+    )
+    ...
+```
+
+Inside the snapshots pinned at model start, it takes each input's maximum,
+uses the smallest as the watermark (minus `lag`), and keeps only rows at or
+below it, so data newer than the slowest source is excluded everywhere. `lag`
+covers transactions that stamp a value before they commit. The watermark is
+logged. Rows that are updated or deleted in place, rather than appended, still
+need change-data capture or replication into one database.
+
 ## Consistency and permissions
 
 - The result is always materialized through the active target connection.
 - Every named source uses a read-only `REPEATABLE READ` transaction, giving it
-  a stable per-database snapshot for the duration of the model. Each database
-  still has an independent transaction, so PyBridge cannot provide a single
-  atomic snapshot across separate Postgres servers. For strict cross-system
-  consistency, filter every source to a shared application watermark.
+  a stable per-database snapshot for the duration of the model. Target reads
+  also share one `REPEATABLE READ` snapshot by default; set
+  `pybridge_target_isolation="read committed"` to opt out. Under repeatable
+  read, an incremental merge into rows another session changes concurrently
+  fails with a serialization error instead of overwriting them.
+- Snapshots start at model start: PyBridge opens the target and every routed
+  source the model declares and runs a first query on each back to back, then
+  logs the measured gap (`Pinned source snapshots within N ms`). Separate
+  servers still have independent transactions, so this is a few milliseconds
+  of skew, not one atomic snapshot. For strict cross-system consistency, use
+  `consistent_cut` (below).
 - Use read-only, least-privileged roles for named source connections.
 - Connection passwords are not embedded in compiled Python model code. Use
   `env_var()` in profiles so dbt can scrub secrets from its logs and artifacts.

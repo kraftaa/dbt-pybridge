@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import os
 from threading import Lock
+import time
 from typing import Any, Callable, Dict, Iterator, Mapping, Optional
 import uuid
 import warnings
@@ -232,6 +233,7 @@ class LocalPostgresSession:
         logger: Optional[Callable[[str], None]] = None,
         connection_name: str = "target",
         usage_tracker: Optional[ModelUsageTracker] = None,
+        target_isolation: str = "repeatable read",
     ) -> None:
         self.credentials = credentials
         self.limits = limits
@@ -276,7 +278,13 @@ class LocalPostgresSession:
         connect_kwargs["connect_timeout"] = getattr(credentials, "connect_timeout", 10)
         self.conn = psycopg2.connect(**connect_kwargs)
         if connection_name == "target":
-            self.conn.autocommit = False
+            # Reads and writes share this transaction. REPEATABLE READ gives
+            # every ref()/source() read in the model one snapshot; writes
+            # still see their own changes. A concurrent update to rows this
+            # model merges into fails loudly with a serialization error.
+            self.conn.set_session(
+                isolation_level=target_isolation.upper(), autocommit=False
+            )
         else:
             # A stable snapshot per source avoids seeing changes midway through
             # a model. Separate servers still cannot share one global snapshot.
@@ -288,6 +296,12 @@ class LocalPostgresSession:
 
     def close(self) -> None:
         self.conn.close()
+
+    def pin_snapshot(self):
+        """Run a first query so the REPEATABLE READ snapshot starts now."""
+        with self.conn.cursor() as cur:
+            cur.execute("select clock_timestamp()")
+            return cur.fetchone()[0]
 
     def relation_columns(self, relation_sql: str):
         """Return (name, type_oid, precision, scale) for each relation column."""
@@ -559,7 +573,15 @@ class PostgresSessionRegistry:
         dataframe_backend: str,
         logger: Optional[Callable[[str], None]] = None,
         session_factory=LocalPostgresSession,
+        target_isolation: str = "repeatable read",
     ) -> None:
+        normalized_isolation = " ".join(str(target_isolation).lower().split())
+        if normalized_isolation not in {"repeatable read", "read committed"}:
+            raise RuntimeError(
+                "pybridge_target_isolation must be 'repeatable read' or 'read committed', "
+                f"got {target_isolation!r}"
+            )
+        self._target_isolation = normalized_isolation
         self._target_credentials = target_credentials
         if named_connections is not None and not isinstance(named_connections, Mapping):
             raise RuntimeError("pybridge_connections must be a mapping of connection names to settings")
@@ -620,9 +642,31 @@ class PostgresSessionRegistry:
             logger=self._logger,
             connection_name=name,
             usage_tracker=self._usage_tracker,
+            target_isolation=self._target_isolation,
         )
         self._sessions[name] = session
         return session
+
+    def pin_snapshots(self, connection_names) -> None:
+        """Start the target and every named source snapshot back to back.
+
+        REPEATABLE READ snapshots begin at a transaction's first query, so
+        lazily opened sources would otherwise start whenever the model first
+        touches them (for a DuckDB join, after the other side has streamed).
+        Separate servers still cannot share one snapshot; this bounds and
+        logs the skew instead of leaving it unbounded.
+        """
+        names = ["target"] + sorted({str(n) for n in connection_names if n} - {"target"})
+        if len(names) == 1:
+            return
+        sessions = [(name, self.get(name)) for name in names]
+        # Measure locally: server clocks on different hosts may disagree.
+        started = time.monotonic()
+        pinned = [(name, session.pin_snapshot()) for name, session in sessions]
+        skew_ms = (time.monotonic() - started) * 1000
+        if self._logger is not None:
+            listed = ", ".join(f"{name}@{ts}" for name, ts in pinned)
+            self._logger(f"Pinned source snapshots within {skew_ms:.1f} ms ({listed})")
 
     def close(self) -> None:
         first_error = None

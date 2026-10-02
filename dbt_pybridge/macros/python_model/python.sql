@@ -113,4 +113,14 @@ def source(*args, dbt_load_df_function):
         connection_name=sources[key]["connection"] or None,
     )
 
+{%- set source_connections = [] -%}
+{%- for _route in source_dict.values() -%}
+    {%- if _route['connection'] and _route['connection'] not in source_connections -%}
+        {%- do source_connections.append(_route['connection']) -%}
+    {%- endif -%}
+{%- endfor %}
+
+# Read by the PyBridge runner to start every source snapshot at model start.
+__pybridge_source_connections__ = {{ source_connections | sort | tojson }}
+
 {% endmacro %}

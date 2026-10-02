@@ -170,6 +170,71 @@ class RelationFrame:
         return self._load()
 
 
+_PLAIN_COLUMN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_$]*$")
+
+
+def consistent_cut(*inputs, lag=None, log=print):
+    """Filter every input to one shared watermark, for consistency across servers.
+
+    Pass ``(relation_frame, column)`` pairs whose column only grows (an
+    ``updated_at`` or ``created_at`` timestamp, or a sequence id). Inside the
+    snapshots pinned at model start, the watermark is the smallest of the
+    per-input maximums, minus ``lag``; each input keeps only rows with
+    ``column <= watermark``. Rows past the slowest source are excluded
+    everywhere, so the inputs describe the same moment. Use ``lag`` to cover
+    transactions that stamp a value before they commit.
+
+    Returns the filtered frames in input order.
+    """
+    if not inputs:
+        raise RuntimeError("consistent_cut() needs at least one (relation, column) pair")
+    pairs = []
+    for item in inputs:
+        try:
+            frame, column = item
+        except (TypeError, ValueError):
+            raise RuntimeError(
+                "consistent_cut() takes (relation, column) pairs, for example "
+                "consistent_cut((dbt.source('app', 'customers'), 'updated_at'), ...)"
+            ) from None
+        if not isinstance(frame, RelationFrame) or isinstance(frame, FederatedJoinFrame):
+            raise RuntimeError(
+                "consistent_cut() needs relations from dbt.ref()/dbt.source(); "
+                "apply it before a DuckDB join"
+            )
+        column = str(column)
+        if not _PLAIN_COLUMN_RE.fullmatch(column):
+            raise RuntimeError(f"consistent_cut() column must be a plain column name, got {column!r}")
+        pairs.append((frame, column))
+
+    maximums = []
+    for frame, column in pairs:
+        with frame._session.conn.cursor() as cur:
+            cur.execute(f"select max({quote_ident(column)}) from {frame._relation_sql}")
+            maximums.append(cur.fetchone()[0])
+    present = [value for value in maximums if value is not None]
+    if not present:
+        log("[pybridge] consistent_cut: every input is empty; nothing to filter")
+        return tuple(frame for frame, _ in pairs)
+    watermark = min(present)
+    if lag is not None:
+        watermark = watermark - lag
+    log(f"[pybridge] consistent_cut watermark {watermark!r} (per-input maximums {maximums!r})")
+
+    filtered = []
+    for frame, column in pairs:
+        with frame._session.conn.cursor() as cur:
+            literal = cur.mogrify("%s", (watermark,)).decode()
+        filtered.append(
+            RelationFrame(
+                frame._session,
+                f"(select * from {frame._relation_sql} "
+                f"where {quote_ident(column)} <= {literal}) as pybridge_cut",
+            )
+        )
+    return tuple(filtered)
+
+
 # Postgres type OID -> DuckDB staging type. Staging tables are created from
 # these up front: inferring types from the first batch silently rounds
 # numerics (1.55 -> 2 after a batch of whole numbers) and rejects later
@@ -488,6 +553,8 @@ class FederatedJoinFrame(RelationFrame):
                 conn.execute(
                     f"set max_temp_directory_size='{self._max_temp_directory_size}'"
                 )
+            # Stage both sides only after their snapshots were pinned at
+            # model start (see PostgresSessionRegistry.pin_snapshots).
             if self._filter_by == "left":
                 self._stage_frame(conn, "pybridge_left", self._left, left_columns)
                 self._stage_frame_by_keys(
@@ -972,6 +1039,9 @@ class LocalPythonModelRunner:
             dataframe_backend=dataframe_backend,
             logger=self._log,
             session_factory=LocalPostgresSession,
+            target_isolation=self._cfg_value(
+                cfg, "pybridge_target_isolation", None, "repeatable read"
+            ),
         )
         session = registry.get()
         primary_error: Optional[BaseException] = None
@@ -979,6 +1049,7 @@ class LocalPythonModelRunner:
         try:
             namespace: Dict[str, Any] = {}
             exec(self.compiled_code, namespace)
+            registry.pin_snapshots(namespace.get("__pybridge_source_connections__") or [])
 
             model_fn = namespace.get("model")
             if model_fn is None:

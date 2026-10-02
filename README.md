@@ -297,6 +297,8 @@ Set model-level configs via `dbt.config(...)` in your python model:
 - `pybridge_allow_large_tables`: bypass hard per-input and aggregate limits (default `false`)
 - `pybridge_chunked_mode`: allow oversized input only when using `iter_batches` (default `false`)
 - `pybridge_batch_size`: default batch size for `iter_batches` (default `100_000`)
+- `pybridge_target_isolation`: isolation for the target connection, `repeatable read`
+  (default; every target read in the model sees one snapshot) or `read committed`
 - `pybridge_column_types`: optional explicit type map for created target tables, for example:
   - `{"id": "numeric(18,0)", "created_at": "timestamp", "payload": "jsonb"}`
 - `pybridge_categorical_types`: optional categorical-column enum type map, for example:

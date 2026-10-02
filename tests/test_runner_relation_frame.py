@@ -487,6 +487,18 @@ def test_duckdb_join_filter_by_needs_a_single_key():
         left.join(right, on=["a", "b"], engine="duckdb", filter_by="left")
 
 
+def test_consistent_cut_validates_inputs():
+    from dbt_pybridge import consistent_cut
+
+    frame = RelationFrame(DummySession(), '"public"."a"')
+    with pytest.raises(RuntimeError, match="at least one"):
+        consistent_cut()
+    with pytest.raises(RuntimeError, match="pairs"):
+        consistent_cut(frame)
+    with pytest.raises(RuntimeError, match="plain column name"):
+        consistent_cut((frame, "updated_at) or (1=1"))
+
+
 def test_duckdb_join_regroups_large_results_into_exact_batches():
     pytest.importorskip("duckdb")
     rows = 5_000  # spans several DuckDB vectors

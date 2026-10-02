@@ -1,4 +1,4 @@
-"""Real Postgres + dbt checks for typed DuckDB staging, key filters, and merges."""
+"""Real Postgres + dbt checks for snapshots, typed DuckDB staging, and merges."""
 
 import os
 from decimal import Decimal
@@ -47,12 +47,19 @@ def databases():
         (APP_DB, [
             "create table public.customers (customer_id bigint, customer_name text)",
             "insert into public.customers values (1, 'Ada'), (2, 'Lin'), (3, 'Mo')",
+            "create table public.signups (customer_id bigint, signed_up_at timestamptz)",
+            "insert into public.signups values "
+            "(1, '2024-01-01T00:00Z'), (2, '2024-01-03T00:00Z'), (3, '2024-01-05T00:00Z')",
         ]),
         (BILLING_DB, [
             "create table public.orders (order_id bigint, customer_id bigint, amount numeric(12,2))",
             # Whole numbers first: inferring DuckDB types from the first batch
             # used to stage DECIMAL(2,0) and round 8.25 to 8.
             "insert into public.orders values (10, 1, 12), (11, 2, 8.25), (12, 3, 1.55)",
+            # Billing has only replicated up to Jan 4, so the cut must drop
+            # the Jan 5 signup even though app already has it.
+            "create table public.payments (customer_id bigint, paid_at timestamptz)",
+            "insert into public.payments values (1, '2024-01-02T00:00Z'), (2, '2024-01-04T00:00Z')",
         ]),
         (TARGET_DB, [
             "create schema transform",
@@ -98,6 +105,7 @@ def _run_dbt(tmp_path, models):
                 pybridge_connection: app_db
             tables:
               - name: customers
+              - name: signups
           - name: billing
             database: {BILLING_DB}
             schema: public
@@ -106,6 +114,7 @@ def _run_dbt(tmp_path, models):
                 pybridge_connection: billing_db
             tables:
               - name: orders
+              - name: payments
           - name: local
             database: {TARGET_DB}
             schema: public
@@ -151,6 +160,7 @@ def _run_dbt(tmp_path, models):
         ],
         text=True,
         capture_output=True,
+        env={**os.environ, "PYBRIDGE_IT_BILLING_DB": BILLING_DB, "PYBRIDGE_IT_TARGET_DB": TARGET_DB},
     )
 
 
@@ -164,17 +174,39 @@ def _rows(database, query):
         conn.close()
 
 
-def test_federated_join_keeps_numeric_precision(databases, tmp_path):
+# Model code is trusted, so it can simulate a concurrent writer committing a
+# row in the middle of the model run.
+CONCURRENT_INSERT = f"""
+def _commit_concurrently(database, statement):
+    import os
+    import psycopg2
+
+    conn = psycopg2.connect(
+        host={INTEGRATION_HOST!r}, port={PORT}, user={USER!r},
+        password={PASSWORD!r}, dbname=os.environ[database],
+    )
+    with conn, conn.cursor() as cur:
+        cur.execute(statement)
+    conn.close()
+"""
+
+
+def test_federated_join_pins_snapshots_and_keeps_numeric_precision(databases, tmp_path):
     completed = _run_dbt(tmp_path, {
-        "customer_orders": """
+        "customer_orders": CONCURRENT_INSERT + """
 def model(dbt, session):
     dbt.config(materialized="table", pybridge_batch_size=1)
     customers = dbt.source("app", "customers").select("customer_id, customer_name")
     orders = dbt.source("billing", "orders").select("order_id, customer_id, amount")
+    # Committed after model start, before billing is first queried.
+    _commit_concurrently(
+        "PYBRIDGE_IT_BILLING_DB", "insert into public.orders values (13, 1, 99.99)"
+    )
     return customers.join(orders, on="customer_id", how="inner", engine="duckdb")
 """,
     })
     assert completed.returncode == 0, completed.stdout + "\n" + completed.stderr
+    assert "Pinned source snapshots within" in completed.stdout
 
     assert _rows(
         TARGET_DB,
@@ -184,6 +216,25 @@ def model(dbt, session):
         (11, "Lin", Decimal("8.25")),
         (12, "Mo", Decimal("1.55")),
     ]
+
+
+def test_target_reads_share_one_snapshot(databases, tmp_path):
+    completed = _run_dbt(tmp_path, {
+        "event_counts": CONCURRENT_INSERT + """
+def model(dbt, session):
+    import pandas as pd
+
+    dbt.config(materialized="table")
+    first = len(dbt.source("local", "events").as_dataframe())
+    _commit_concurrently(
+        "PYBRIDGE_IT_TARGET_DB", "insert into public.events values (3)"
+    )
+    second = len(dbt.source("local", "events").as_dataframe())
+    return pd.DataFrame({"first_read": [first], "second_read": [second]})
+""",
+    })
+    assert completed.returncode == 0, completed.stdout + "\n" + completed.stderr
+    assert _rows(TARGET_DB, "select first_read, second_read from transform.event_counts") == [(2, 2)]
 
 
 def test_incremental_merge_rejects_duplicate_unique_keys(databases, tmp_path):
@@ -203,6 +254,29 @@ def model(dbt, session):
     assert second.returncode != 0
     assert "rows for unique_key" in second.stdout
     assert _rows(TARGET_DB, "select id, v from transform.keyed") == [(1, "seed")]
+
+
+def test_consistent_cut_aligns_sources_to_the_slowest_watermark(databases, tmp_path):
+    completed = _run_dbt(tmp_path, {
+        "aligned_activity": """
+def model(dbt, session):
+    import pandas as pd
+    from dbt_pybridge import consistent_cut
+
+    dbt.config(materialized="table")
+    signups, payments = consistent_cut(
+        (dbt.source("app", "signups"), "signed_up_at"),
+        (dbt.source("billing", "payments"), "paid_at"),
+    )
+    return pd.DataFrame({
+        "signups": [len(signups.as_dataframe())],
+        "payments": [len(payments.as_dataframe())],
+    })
+""",
+    })
+    assert completed.returncode == 0, completed.stdout + "\n" + completed.stderr
+    assert "consistent_cut watermark" in completed.stdout
+    assert _rows(TARGET_DB, "select signups, payments from transform.aligned_activity") == [(2, 2)]
 
 
 def test_duckdb_join_filter_by_fetches_only_matching_keys(databases, tmp_path):

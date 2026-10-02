@@ -301,7 +301,7 @@ def test_session_registry_is_lazy_and_caches_named_connections():
     created = []
 
     class RegistrySession:
-        def __init__(self, credentials, limits, dataframe_backend, logger, connection_name, usage_tracker=None):
+        def __init__(self, credentials, limits, dataframe_backend, logger, connection_name, usage_tracker=None, target_isolation="repeatable read"):
             self.credentials = credentials
             self.connection_name = connection_name
             self.closed = False
@@ -427,3 +427,57 @@ def test_model_usage_tracker_enforces_aggregate_row_limit():
         tracker.record('"public"."b"', rows=2, byte_count=100, bypass_limits=False)
 
     assert "pybridge_max_total_rows" in str(exc.value)
+
+
+def test_session_registry_pins_target_and_named_snapshots_together():
+    import datetime as dt
+
+    pinned = []
+    messages = []
+
+    class PinSession:
+        def __init__(self, credentials, limits, dataframe_backend, logger, connection_name, usage_tracker=None, target_isolation="repeatable read"):
+            self.connection_name = connection_name
+
+        def pin_snapshot(self):
+            pinned.append(self.connection_name)
+            return dt.datetime(2024, 1, 1)
+
+    settings = {"host": "h.example.invalid", "user": "reader", "database": "d", "password": "x"}
+    registry = PostgresSessionRegistry(
+        target_credentials=FakeCredentials(database="analytics"),
+        named_connections={"app_db": settings, "billing_db": settings, "unused_db": settings},
+        limits=ModelLimits(),
+        dataframe_backend="pandas",
+        logger=messages.append,
+        session_factory=PinSession,
+    )
+
+    registry.pin_snapshots(["billing_db", "app_db", "billing_db"])
+
+    # Only connections the model declares are opened; target goes first.
+    assert pinned == ["target", "app_db", "billing_db"]
+    assert "Pinned source snapshots within" in messages[-1]
+
+
+def test_session_registry_skips_pinning_single_database_models():
+    registry = PostgresSessionRegistry(
+        target_credentials=FakeCredentials(database="analytics"),
+        named_connections={},
+        limits=ModelLimits(),
+        dataframe_backend="pandas",
+        session_factory=lambda **kwargs: pytest.fail("no session should open"),
+    )
+
+    registry.pin_snapshots([])
+
+
+def test_session_registry_validates_target_isolation():
+    with pytest.raises(RuntimeError, match="pybridge_target_isolation"):
+        PostgresSessionRegistry(
+            target_credentials=FakeCredentials(database="analytics"),
+            named_connections={},
+            limits=ModelLimits(),
+            dataframe_backend="pandas",
+            target_isolation="serializable-ish",
+        )

@@ -72,6 +72,7 @@ def test_build_source_function_compiles_connection_route():
     )
 
     assert calls == [(relation_name, "app_db")]
+    assert namespace["__pybridge_source_connections__"] == ["app_db"]
 
 
 def test_build_ref_function_rejects_named_connection_route():
@@ -142,3 +143,4 @@ def test_unrouted_ref_and_source_compile_to_valid_python():
     namespace["source"]("raw", "events", dbt_load_df_function=load)
 
     assert calls == [(relation_name, None), (relation_name, None)]
+    assert namespace["__pybridge_source_connections__"] == []
