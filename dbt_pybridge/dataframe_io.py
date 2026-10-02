@@ -65,15 +65,10 @@ def _is_null_scalar(value) -> bool:
     return False
 
 
-def _iter_non_null_values(series, limit: int = 128):
-    count = 0
+def _iter_non_null_values(series):
     for value in series.values:
-        if _is_null_scalar(value):
-            continue
-        yield value
-        count += 1
-        if count >= limit:
-            break
+        if not _is_null_scalar(value):
+            yield value
 
 
 def _infer_integer_type(dtype) -> str:
@@ -112,32 +107,6 @@ def _infer_float_type(dtype) -> str:
     if bits <= 32:
         return "real"
     return "double precision"
-
-
-def _infer_decimal_type(values) -> str:
-    max_precision = 0
-    max_scale = 0
-
-    for value in values:
-        if not isinstance(value, Decimal):
-            return "numeric"
-        if not value.is_finite():
-            return "numeric"
-        _, digits, exponent = value.as_tuple()
-        if exponent >= 0:
-            scale = 0
-            precision = len(digits) + exponent
-        else:
-            scale = -exponent
-            precision = max(len(digits), scale)
-        max_precision = max(max_precision, precision)
-        max_scale = max(max_scale, scale)
-
-    if max_precision <= 0:
-        return "numeric"
-    if max_precision > 1000 or max_scale > 1000:
-        return "numeric"
-    return f"numeric({max_precision},{max_scale})"
 
 
 def _infer_array_element_type(sample_values) -> Optional[str]:
@@ -182,12 +151,17 @@ def _infer_array_element_type(sample_values) -> Optional[str]:
 
 
 def _infer_object_type(series) -> str:
-    sample_values = [_to_python_scalar(v) for v in _iter_non_null_values(series, limit=128)]
+    # Check every value: a type guessed from a sample fails mid-COPY (or
+    # silently coerces) when a later row disagrees.
+    sample_values = [_to_python_scalar(v) for v in _iter_non_null_values(series)]
     if not sample_values:
         return "text"
 
     if all(isinstance(v, Decimal) for v in sample_values):
-        return _infer_decimal_type(sample_values)
+        # Unconstrained: Postgres silently rounds extra scale into numeric(p,s),
+        # and later batches or incremental runs may carry more digits. Pin a
+        # precision with pybridge_column_types when one is wanted.
+        return "numeric"
     if all(isinstance(v, uuid.UUID) for v in sample_values):
         return "uuid"
     if all(isinstance(v, dict) for v in sample_values):
@@ -732,6 +706,48 @@ def _validate_unique_key(unique_key: Optional[Sequence[str]], columns: Sequence[
     return keys
 
 
+def _reject_duplicate_unique_keys(cur, temp_sql: str, unique_key: Sequence[str]) -> None:
+    # merge and delete+insert only check incoming rows against the target, so
+    # two incoming rows with one key would both be inserted (and merge would
+    # update from an arbitrary one). Rows with a NULL key never match anyway.
+    key_sql = ", ".join(quote_ident(col) for col in unique_key)
+    not_null_sql = " and ".join(f"{quote_ident(col)} is not null" for col in unique_key)
+    cur.execute(
+        f"""
+        select {key_sql}, count(*)
+        from {temp_sql}
+        where {not_null_sql}
+        group by {key_sql}
+        having count(*) > 1
+        limit 1
+        """
+    )
+    duplicate = cur.fetchone()
+    if duplicate:
+        raise RuntimeError(
+            f"Python model output has {duplicate[-1]} rows for unique_key "
+            f"{dict(zip(unique_key, duplicate[:-1]))}. Deduplicate the result before "
+            "an incremental merge or delete+insert."
+        )
+
+
+def _reject_duplicate_unique_keys_in_frame(df, unique_key: Sequence[str]) -> None:
+    # First run: there is no table yet, so check the dataframe itself.
+    missing = [col for col in unique_key if col not in df.columns]
+    if missing or df.empty:
+        return
+    keyed = df.loc[df[list(unique_key)].notna().all(axis=1), list(unique_key)]
+    duplicated = keyed[keyed.duplicated(keep=False)]
+    if not duplicated.empty:
+        first = duplicated.iloc[0]
+        count = int((keyed == first).all(axis=1).sum())
+        raise RuntimeError(
+            f"Python model output has {count} rows for unique_key "
+            f"{ {col: first[col] for col in unique_key} }. Deduplicate the result before "
+            "an incremental merge or delete+insert."
+        )
+
+
 def _merge_from_temp(cur, target: TargetRelation, temp_sql: str, columns: Sequence[str], unique_key: Sequence[str]) -> None:
     target_sql = target.render()
     update_columns = [col for col in columns if col not in unique_key]
@@ -885,6 +901,8 @@ def _apply_incremental_chunk(
     target_columns = [name for name, _ in target_columns_with_types]
     target_column_types = {name: col_type for name, col_type in target_columns_with_types}
     if not target_columns:
+        if incremental_strategy in {"merge", "delete+insert"} and unique_key:
+            _reject_duplicate_unique_keys_in_frame(chunk_df, list(unique_key))
         first_run_types = _resolve_column_sql_types(
             chunk_df,
             column_types=column_types,
@@ -940,6 +958,7 @@ def _apply_incremental_chunk(
         temporary=True,
     )
     _copy_dataframe(cur, temp, aligned, column_sql_types=target_column_types)
+    _reject_duplicate_unique_keys(cur, temp_sql, keys)
     if incremental_strategy == "merge":
         _merge_from_temp(cur, target, temp_sql, target_columns, keys)
     else:

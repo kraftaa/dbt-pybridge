@@ -298,7 +298,10 @@ Default inferred target types now include:
 
 Notes:
 
-- `Decimal` object columns infer `numeric(precision,scale)` from sampled values.
+- `Decimal` object columns create unconstrained `numeric`, so later rows or
+  incremental runs with more digits are never rounded. Pin a precision with
+  `pybridge_column_types` if you need one.
+- Types are inferred from every value in the column, not a sample.
 - Empty or ambiguous object columns fall back to `text` (or `jsonb` for ambiguous list structures).
 - You can always override with `pybridge_column_types`.
 
