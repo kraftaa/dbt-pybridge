@@ -443,7 +443,7 @@ def test_session_registry_pins_target_and_named_snapshots_together():
             pinned.append(self.connection_name)
             return dt.datetime(2024, 1, 1)
 
-    settings = {"host": "h.example.invalid", "user": "reader", "database": "d", "password": "x"}
+    settings = {"host": "h.example.invalid", "user": "reader", "database": "d"}
     registry = PostgresSessionRegistry(
         target_credentials=FakeCredentials(database="analytics"),
         named_connections={"app_db": settings, "billing_db": settings, "unused_db": settings},
@@ -480,4 +480,122 @@ def test_session_registry_validates_target_isolation():
             limits=ModelLimits(),
             dataframe_backend="pandas",
             target_isolation="serializable-ish",
+        )
+
+
+@pytest.mark.parametrize(
+    "auth",
+    [
+        {"sslmode": "verify-full", "sslcert": "/certs/client.crt", "sslkey": "/certs/client.key"},
+        {"gssencmode": "prefer", "krbsrvname": "postgres"},
+        {},
+    ],
+    ids=["client-certificate", "kerberos", "pgpass-or-trust"],
+)
+def test_named_credentials_allow_passwordless_auth(auth):
+    from dbt_pybridge.session import NamedPostgresCredentials
+
+    credentials = NamedPostgresCredentials.from_mapping(
+        "app_db",
+        {"host": "app.example.invalid", "user": "reader", "database": "application", **auth},
+    )
+
+    assert credentials.password is None
+    for key, value in auth.items():
+        assert getattr(credentials, key) == value
+
+
+def test_named_credentials_hide_ssl_key_password():
+    from dbt_pybridge.session import NamedPostgresCredentials
+
+    credentials = NamedPostgresCredentials.from_mapping(
+        "app_db",
+        {
+            "host": "app.example.invalid",
+            "user": "reader",
+            "database": "application",
+            "sslkey": "/certs/client.key",
+            "sslpassword": "key-secret",
+        },
+    )
+
+    assert credentials.sslpassword == "key-secret"
+    assert "key-secret" not in repr(credentials)
+
+
+def _named_with_command(command):
+    from dbt_pybridge.session import NamedPostgresCredentials
+
+    return NamedPostgresCredentials.from_mapping(
+        "app_db",
+        {
+            "host": "app.example.invalid",
+            "user": "reader",
+            "database": "application",
+            "password_command": command,
+        },
+    )
+
+
+def test_password_command_supplies_a_just_in_time_token(monkeypatch):
+    import sys
+
+    captured = {}
+
+    class Connection:
+        def set_session(self, **kwargs):
+            pass
+
+        def get_dsn_parameters(self):
+            return {"dbname": "application"}
+
+    def fake_connect(**kwargs):
+        captured.update(kwargs)
+        return Connection()
+
+    monkeypatch.setattr("dbt_pybridge.session.psycopg2.connect", fake_connect)
+    credentials = _named_with_command(
+        [sys.executable, "-c", "print('short-lived-token')"]
+    )
+
+    LocalPostgresSession(credentials, ModelLimits(), connection_name="app_db")
+
+    assert captured["password"] == "short-lived-token"
+    assert "print" not in repr(credentials)
+
+
+def test_password_command_failure_does_not_connect(monkeypatch):
+    import sys
+
+    monkeypatch.setattr(
+        "dbt_pybridge.session.psycopg2.connect",
+        lambda **kwargs: (_ for _ in ()).throw(AssertionError("must not connect")),
+    )
+    credentials = _named_with_command(
+        [sys.executable, "-c", "import sys; sys.stderr.write('token expired\\n'); sys.exit(3)"]
+    )
+
+    with pytest.raises(RuntimeError, match="status 3: token expired"):
+        LocalPostgresSession(credentials, ModelLimits(), connection_name="app_db")
+
+
+@pytest.mark.parametrize("command", ["aws rds generate-db-auth-token", [], [""], [1]])
+def test_password_command_must_be_a_list_of_strings(command):
+    with pytest.raises(RuntimeError, match="password_command must be"):
+        _named_with_command(command)
+
+
+def test_password_command_is_exclusive_with_other_auth():
+    from dbt_pybridge.session import NamedPostgresCredentials
+
+    with pytest.raises(RuntimeError, match="configure only one of"):
+        NamedPostgresCredentials.from_mapping(
+            "app_db",
+            {
+                "host": "h",
+                "user": "u",
+                "database": "d",
+                "password": "x",
+                "password_command": ["true"],
+            },
         )

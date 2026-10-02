@@ -47,11 +47,32 @@ analytics_profile:
 Supported named-connection settings are `host`, `user`, `password` (or
 `pass`), `password_env`, `service`, `passfile`, `database` (or `dbname`),
 `port`, `connect_timeout`, `search_path`, `keepalives_idle`, `sslmode`,
-`sslcert`, `sslkey`, `sslrootcert`, and `application_name`. Configure only one
-of `password`/`pass`, `password_env`, or `passfile`. A libpq `service` may
-supply the host, user, database, and authentication settings. `password_env`
-is resolved only when the named connection opens and is not retained on the
-validated credential object.
+`sslcert`, `sslkey`, `sslrootcert`, `sslpassword`, `gssencmode`, `krbsrvname`,
+and `application_name`. Configure at most one of `password`/`pass`,
+`password_env`, or `passfile`. A libpq `service` may supply the host, user,
+database, and authentication settings. `password_env` is resolved only when the
+named connection opens and is not retained on the validated credential object.
+
+A password is not required. Prefer authentication that keeps no long-lived
+secret in the dbt process: a client certificate (`sslmode: verify-full` with
+`sslcert`/`sslkey`) or Kerberos/GSSAPI. `~/.pgpass` and trust authentication
+also work.
+
+For short-lived tokens (AWS RDS IAM, Azure Entra ID, Google Cloud SQL, Vault),
+set `password_command` to a command as a list. PyBridge runs it, without a
+shell, each time the connection opens and uses its output as the password; the
+token is never logged or stored:
+
+```yaml
+        billing_db:
+          host: billing.abc123.us-east-1.rds.amazonaws.com
+          user: reader
+          dbname: billing
+          sslmode: verify-full
+          password_command: ["aws", "rds", "generate-db-auth-token",
+                             "--hostname", "billing.abc123.us-east-1.rds.amazonaws.com",
+                             "--port", "5432", "--username", "reader"]
+```
 
 ## Route sources
 
@@ -253,5 +274,9 @@ need change-data capture or replication into one database.
 - Use read-only, least-privileged roles for named source connections.
 - Connection passwords are not embedded in compiled Python model code. Use
   `env_var()` in profiles so dbt can scrub secrets from its logs and artifacts.
+- Python model code runs inside the dbt process, so it can read any credential
+  that process holds, including environment variables named by
+  `password_env`, which child processes also inherit. Certificate or Kerberos
+  authentication avoids holding a reusable password at all.
 - Load logs include the connection alias so source activity can be attributed
   without printing connection credentials.

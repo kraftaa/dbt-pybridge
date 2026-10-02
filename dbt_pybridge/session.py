@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import os
+import subprocess
 from threading import Lock
 import time
 from typing import Any, Callable, Dict, Iterator, Mapping, Optional
@@ -106,6 +107,7 @@ class NamedPostgresCredentials:
     user: Optional[str] = None
     password: Optional[str] = field(default=None, repr=False)
     password_env: Optional[str] = field(default=None, repr=False)
+    password_command: Optional[tuple] = field(default=None, repr=False)
     service: Optional[str] = None
     passfile: Optional[str] = field(default=None, repr=False)
     port: Optional[int] = 5432
@@ -116,6 +118,9 @@ class NamedPostgresCredentials:
     sslcert: Optional[str] = None
     sslkey: Optional[str] = None
     sslrootcert: Optional[str] = None
+    sslpassword: Optional[str] = field(default=None, repr=False)
+    gssencmode: Optional[str] = None
+    krbsrvname: Optional[str] = None
     application_name: Optional[str] = "dbt-pybridge"
 
     @classmethod
@@ -128,7 +133,8 @@ class NamedPostgresCredentials:
         supported = {
             "database", "dbname", "host", "user", "password", "pass", "port",
             "connect_timeout", "search_path", "keepalives_idle", "sslmode", "sslcert",
-            "sslkey", "sslrootcert", "application_name", "password_env", "service",
+            "sslkey", "sslrootcert", "sslpassword", "gssencmode", "krbsrvname",
+            "application_name", "password_env", "password_command", "service",
             "passfile",
         }
         unknown = sorted(set(raw) - supported)
@@ -151,11 +157,31 @@ class NamedPostgresCredentials:
         password_env = raw.get("password_env")
         service = raw.get("service")
         passfile = raw.get("passfile")
-        auth_methods = [password is not None, password_env is not None, passfile is not None]
+        password_command = raw.get("password_command")
+        if password_command is not None:
+            # A list, never a shell string: no quoting rules, no shell injection.
+            if (
+                isinstance(password_command, (str, bytes))
+                or not isinstance(password_command, (list, tuple))
+                or not password_command
+                or not all(isinstance(part, str) and part for part in password_command)
+            ):
+                raise RuntimeError(
+                    f"Invalid pybridge_connections entry {name!r}: password_command must be "
+                    "a non-empty list of strings, for example "
+                    "['aws', 'rds', 'generate-db-auth-token', '--hostname', '...']"
+                )
+            password_command = tuple(password_command)
+        auth_methods = [
+            password is not None,
+            password_env is not None,
+            passfile is not None,
+            password_command is not None,
+        ]
         if sum(auth_methods) > 1:
             raise RuntimeError(
                 f"Invalid pybridge_connections entry {name!r}: configure only one of "
-                "password/pass, password_env, or passfile"
+                "password/pass, password_env, password_command, or passfile"
             )
         if service is not None and not str(service).strip():
             raise RuntimeError(
@@ -169,8 +195,8 @@ class NamedPostgresCredentials:
             )
             if value is None or not str(value).strip()
         ]
-        if not service and not any(auth_methods):
-            missing.append("password/pass, password_env, or passfile")
+        # No auth setting is required: libpq can authenticate with a client
+        # certificate (sslcert/sslkey), Kerberos/GSSAPI, ~/.pgpass, or trust.
         if missing:
             raise RuntimeError(
                 f"Invalid pybridge_connections entry {name!r}: missing required keys {missing}"
@@ -210,6 +236,7 @@ class NamedPostgresCredentials:
             user=None if raw.get("user") is None else str(raw["user"]),
             password=None if password is None else str(password),
             password_env=optional_string("password_env"),
+            password_command=password_command,
             service=optional_string("service"),
             passfile=optional_string("passfile"),
             port=port,
@@ -220,8 +247,40 @@ class NamedPostgresCredentials:
             sslcert=optional_string("sslcert"),
             sslkey=optional_string("sslkey"),
             sslrootcert=optional_string("sslrootcert"),
+            sslpassword=optional_string("sslpassword"),
+            gssencmode=optional_string("gssencmode"),
+            krbsrvname=optional_string("krbsrvname"),
             application_name=optional_string("application_name", "dbt-pybridge"),
         )
+
+
+def _run_password_command(command, connection_name: str, timeout: int) -> str:
+    """Fetch a short-lived token (RDS IAM, Entra ID, Vault) just before connecting.
+
+    The token is passed straight to libpq and never logged or stored.
+    """
+    try:
+        completed = subprocess.run(
+            list(command), capture_output=True, text=True, timeout=timeout, check=False
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(
+            f"password_command for PyBridge connection {connection_name!r} failed to run: "
+            f"{type(exc).__name__}"
+        ) from None
+    if completed.returncode != 0:
+        detail = (completed.stderr or "").strip().splitlines()
+        raise RuntimeError(
+            f"password_command for PyBridge connection {connection_name!r} exited with "
+            f"status {completed.returncode}"
+            + (f": {detail[-1][:200]}" if detail else "")
+        )
+    token = (completed.stdout or "").strip()
+    if not token:
+        raise RuntimeError(
+            f"password_command for PyBridge connection {connection_name!r} printed no token"
+        )
+    return token
 
 
 class LocalPostgresSession:
@@ -250,7 +309,10 @@ class LocalPostgresSession:
             connect_kwargs["options"] = "-c search_path={}".format(
                 str(search_path).replace(" ", "\\ ")
             )
-        for key in ("sslmode", "sslcert", "sslkey", "sslrootcert", "application_name"):
+        for key in (
+            "sslmode", "sslcert", "sslkey", "sslrootcert", "sslpassword",
+            "gssencmode", "krbsrvname", "application_name",
+        ):
             value = getattr(credentials, key, None)
             if value:
                 connect_kwargs[key] = value
@@ -273,6 +335,14 @@ class LocalPostgresSession:
                     f"Environment variable {password_env!r} configured for PyBridge "
                     f"connection {connection_name!r} is not set"
                 )
+        password_command = getattr(credentials, "password_command", None)
+        if password_command:
+            password = _run_password_command(
+                password_command,
+                connection_name,
+                # connect_timeout 0 is libpq's "wait forever"; honor it here too.
+                timeout=getattr(credentials, "connect_timeout", 10) or None,
+            )
         if password is not None:
             connect_kwargs["password"] = password
         connect_kwargs["connect_timeout"] = getattr(credentials, "connect_timeout", 10)

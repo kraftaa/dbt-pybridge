@@ -81,7 +81,7 @@ def databases():
         admin.close()
 
 
-def _run_dbt(tmp_path, models):
+def _run_dbt(tmp_path, models, billing_extra=""):
     project = tmp_path / "project"
     model_dir = project / "models"
     profiles = tmp_path / "profiles"
@@ -124,14 +124,13 @@ def _run_dbt(tmp_path, models):
     for name, body in models.items():
         (model_dir / f"{name}.py").write_text(textwrap.dedent(body).strip() + "\n")
 
-    def connection(database):
+    def connection(database, auth=f"password: {PASSWORD}"):
         return textwrap.indent(textwrap.dedent(f"""
             host: {INTEGRATION_HOST}
             port: {PORT}
             user: {USER}
-            password: {PASSWORD}
             dbname: {database}
-        """).strip(), " " * 10)
+        """).strip() + "\n" + auth, " " * 10)
 
     (profiles / "profiles.yml").write_text(
         textwrap.dedent(f"""
@@ -150,7 +149,9 @@ def _run_dbt(tmp_path, models):
                   pybridge_connections:
                     app_db:
         """).rstrip() + "\n" + connection(APP_DB) + "\n"
-        + "        billing_db:\n" + connection(BILLING_DB) + "\n"
+        + "        billing_db:\n"
+        + (connection(BILLING_DB, billing_extra) if billing_extra else connection(BILLING_DB))
+        + "\n"
     )
     dbt_executable = Path(sys.executable).parent / "dbt"
     return subprocess.run(
@@ -277,6 +278,32 @@ def model(dbt, session):
     assert completed.returncode == 0, completed.stdout + "\n" + completed.stderr
     assert "consistent_cut watermark" in completed.stdout
     assert _rows(TARGET_DB, "select signups, payments from transform.aligned_activity") == [(2, 2)]
+
+
+def test_password_command_runs_from_a_dbt_profile(databases, tmp_path):
+    marker = tmp_path / "token-fetched"
+    command = (
+        "import pathlib, sys; "
+        f"pathlib.Path({str(marker)!r}).write_text('1'); "
+        f"print({PASSWORD!r})"
+    )
+    completed = _run_dbt(
+        tmp_path,
+        {
+            "billing_count": """
+def model(dbt, session):
+    import pandas as pd
+
+    dbt.config(materialized="table")
+    orders = dbt.source("billing", "orders")
+    return pd.DataFrame({"n": [len(orders.as_dataframe())]})
+""",
+        },
+        billing_extra=f"password_command: [{sys.executable!r}, '-c', {command!r}]",
+    )
+    assert completed.returncode == 0, completed.stdout + "\n" + completed.stderr
+    assert marker.exists()
+    assert _rows(TARGET_DB, "select n from transform.billing_count") == [(3,)]
 
 
 def test_duckdb_join_filter_by_fetches_only_matching_keys(databases, tmp_path):
